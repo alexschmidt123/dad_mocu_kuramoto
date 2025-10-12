@@ -1,0 +1,49 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model checkpoints
+*.pth
+trained_surrogate.pth
+test_surrogate.pth
+
+# Generated outputs
+*.png
+*.json
+results.json
+mocu_curves.png
+a_ctrl_distribution.png
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data
+data/
+*.h5
+*.hdf5
+EOF
