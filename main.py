@@ -83,6 +83,27 @@ def random_chooser(env, cands):
     return cands[np.random.randint(len(cands))]
 
 
+def fixed_design_chooser_factory(fixed_sequence):
+    """Fixed (static) design: pre-determined experiment sequence."""
+    step_counter = [0]  # Use list to maintain state across calls
+    
+    def fixed_chooser(env, cands):
+        if step_counter[0] < len(fixed_sequence):
+            chosen = fixed_sequence[step_counter[0]]
+            step_counter[0] += 1
+            # Ensure the pair is in candidates
+            if chosen in cands:
+                return chosen
+            else:
+                # Fallback to first candidate if pre-determined pair not available
+                return cands[0]
+        else:
+            # Fallback to random if we run out of fixed designs
+            return cands[np.random.randint(len(cands))]
+    
+    return fixed_chooser
+
+
 def greedy_chooser(env, cands):
     """Greedy ERM baseline."""
     return choose_next_pair_greedy(env, cands)
