@@ -17,7 +17,7 @@ from data_generation.synthetic_data import SyntheticDataGenerator
 class DataCache:
     """Load cached datasets."""
     
-    def __init__(self, cache_dir: str = "data"):
+    def __init__(self, cache_dir: str = "dataset"):  # Changed from "data"
         self.cache_dir = cache_dir
     
     def get_cache_path(self, split: str, N: int, K: int, n_samples: int, 
@@ -369,7 +369,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     """Complete training pipeline - uses cached data if available."""
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f" Auto-detected device: {device}")
+        print(f" Auto-detected device: {device}")
     
     print("="*80)
     print("SURROGATE MODEL TRAINING PIPELINE")
@@ -384,7 +384,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     print()
     
     # Load data
-    cache = DataCache()
+    cache = DataCache()  # Now uses "dataset" folder
     
     if use_cache:
         # Try to load from cache
@@ -397,7 +397,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
             val_data = cache.load("val", N, K, n_val, n_theta_samples, 123)
             print()
         except FileNotFoundError as e:
-            print(f"\n Error: {e}")
+            print(f"\n Error: {e}")
             print("\nPlease generate data first:")
             print("  python generate_data.py --split both --parallel")
             raise

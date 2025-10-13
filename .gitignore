@@ -32,6 +32,10 @@ results*.json
 mocu_curves.png
 a_ctrl_distribution.png
 
+# Generated data
+dataset/
+models/
+
 # OS
 .DS_Store
 Thumbs.db
