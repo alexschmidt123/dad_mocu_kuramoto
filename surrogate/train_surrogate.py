@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+from torch.cuda.amp import autocast, GradScaler
 from typing import List, Dict, Tuple
 import os
 from surrogate.mpnn_surrogate import MPNNSurrogate
@@ -16,7 +17,7 @@ from data_generation.synthetic_data import SyntheticDataGenerator
 class SurrogateTrainer:
     """Trainer for the MPNN surrogate model with proper batching."""
     
-    def __init__(self, model: MPNNSurrogate, device: str = 'cpu'):
+    def __init__(self, model: MPNNSurrogate, device: str = None):
         self.model = model.to(device)
         self.device = device
         
@@ -342,10 +343,12 @@ class SurrogateTrainer:
 
 def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: int = 200,
                          n_theta_samples: int = 20, epochs: int = 50, lr: float = 1e-3, 
-                         batch_size: int = 32, device: str = 'cpu', 
+                         batch_size: int = 32, device: str = None, 
                          save_path: str = 'trained_surrogate.pth'):
     """Complete training pipeline for the surrogate model."""
-    
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        print(f"✓ Auto-detected device: {device}")
     print("="*80)
     print("SURROGATE MODEL TRAINING PIPELINE")
     print("="*80)
@@ -397,7 +400,7 @@ if __name__ == "__main__":
     print("Testing fixed surrogate training...")
     model, results = train_surrogate_model(
         N=5, K=4, n_train=100, n_val=20, n_theta_samples=10, 
-        epochs=20, device='cpu', save_path='test_surrogate.pth'
+        epochs=20, device=None, save_path='test_surrogate.pth'
     )
     print("\n Training completed successfully!")
     print(f"Final MOCU train loss: {results['mocu']['train_losses'][-1]:.4f}")

@@ -40,7 +40,7 @@ surrogate:
   # Training hyperparameters
   epochs: 30            # Training epochs (50+ for production)
   lr: 0.001             # Learning rate
-  batch_size: 32        # Batch size
+  batch_size: 512
 
 # DAD (Deep Adaptive Design) policy parameters
 dad_bc:
