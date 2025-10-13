@@ -30,11 +30,19 @@ from multiprocessing import Pool, cpu_count
 
 from data_generation.synthetic_data import SyntheticDataGenerator
 
+# Try to import tqdm for progress bars
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+    print("Note: Install tqdm for progress bars: pip install tqdm")
+
 
 class DataCache:
     """Manage cached datasets."""
     
-    def __init__(self, cache_dir: str = "data_cache"):
+    def __init__(self, cache_dir: str = "data"):
         self.cache_dir = cache_dir
         os.makedirs(cache_dir, exist_ok=True)
     
@@ -95,14 +103,13 @@ def generate_single_sample(args):
         
         return data
     except Exception as e:
-        print(f"Warning: Sample generation failed: {e}")
         return None
 
 
 def generate_dataset_parallel(N: int, K: int, n_samples: int, n_theta_samples: int,
                               prior_bounds, omega_range, sim_opts, seed: int,
                               n_workers: int = None) -> List[Dict]:
-    """Generate dataset using parallel processing."""
+    """Generate dataset using parallel processing with progress bar."""
     if n_workers is None:
         n_workers = min(cpu_count() - 2, 20)  # Leave 2 cores free
     
@@ -122,24 +129,35 @@ def generate_dataset_parallel(N: int, K: int, n_samples: int, n_theta_samples: i
         for s in worker_seeds
     ]
     
-    # Generate samples in parallel
+    # Generate samples in parallel with progress bar
     start_time = time.time()
     dataset = []
     
     with Pool(n_workers) as pool:
-        for i, result in enumerate(pool.imap_unordered(generate_single_sample, worker_args)):
-            if result is not None:
-                dataset.append(result)
-            
-            # Progress update
-            if (i + 1) % 50 == 0 or (i + 1) == n_samples:
-                elapsed = time.time() - start_time
-                rate = (i + 1) / elapsed
-                remaining = (n_samples - i - 1) / rate if rate > 0 else 0
-                print(f"  Progress: {i+1}/{n_samples} samples "
-                      f"({(i+1)/n_samples*100:.1f}%) - "
-                      f"Rate: {rate:.2f} samples/sec - "
-                      f"ETA: {remaining/60:.1f} min")
+        if TQDM_AVAILABLE:
+            # Use tqdm progress bar
+            for result in tqdm(pool.imap_unordered(generate_single_sample, worker_args),
+                             total=n_samples,
+                             desc="Generating samples",
+                             unit="sample",
+                             ncols=100):
+                if result is not None:
+                    dataset.append(result)
+        else:
+            # Fallback to manual progress updates
+            for i, result in enumerate(pool.imap_unordered(generate_single_sample, worker_args)):
+                if result is not None:
+                    dataset.append(result)
+                
+                # Progress update every 50 samples
+                if (i + 1) % 50 == 0 or (i + 1) == n_samples:
+                    elapsed = time.time() - start_time
+                    rate = (i + 1) / elapsed
+                    remaining = (n_samples - i - 1) / rate if rate > 0 else 0
+                    progress = (i + 1) / n_samples * 100
+                    print(f"  Progress: {i+1}/{n_samples} ({progress:.1f}%) - "
+                          f"Rate: {rate:.2f} samples/sec - "
+                          f"ETA: {remaining/60:.1f} min")
     
     elapsed = time.time() - start_time
     print(f"✓ Generated {len(dataset)} valid samples in {elapsed/60:.1f} minutes")
@@ -150,7 +168,7 @@ def generate_dataset_parallel(N: int, K: int, n_samples: int, n_theta_samples: i
 
 def generate_dataset_sequential(N: int, K: int, n_samples: int, n_theta_samples: int,
                                 prior_bounds, omega_range, sim_opts, seed: int) -> List[Dict]:
-    """Generate dataset sequentially (original method)."""
+    """Generate dataset sequentially with progress bar."""
     print(f"Sequential data generation:")
     print(f"  Samples: {n_samples}")
     print(f"  MC samples per sample: {n_theta_samples}")
@@ -160,10 +178,43 @@ def generate_dataset_sequential(N: int, K: int, n_samples: int, n_theta_samples:
         n_samples=n_samples, sim_opts=sim_opts, n_theta_samples=n_theta_samples
     )
     
-    start_time = time.time()
-    dataset = generator.generate_dataset(seed=seed)
-    elapsed = time.time() - start_time
+    # Override the generate_dataset method to add progress bar
+    rng = np.random.default_rng(seed)
+    dataset = []
     
+    start_time = time.time()
+    
+    if TQDM_AVAILABLE:
+        # Use tqdm progress bar
+        iterator = tqdm(range(n_samples), 
+                       desc="Generating samples",
+                       unit="sample",
+                       ncols=100)
+    else:
+        iterator = range(n_samples)
+    
+    for i in iterator:
+        try:
+            omega = generator.generate_omega(rng)
+            A_true = generator.generate_true_A(rng)
+            data = generator.run_experiment_sequence(omega, A_true, rng)
+            dataset.append(data)
+        except Exception as e:
+            if not TQDM_AVAILABLE:
+                print(f"Warning: Failed to generate sample {i}: {e}")
+            continue
+        
+        # Manual progress update if no tqdm
+        if not TQDM_AVAILABLE and ((i + 1) % 50 == 0 or (i + 1) == n_samples):
+            elapsed = time.time() - start_time
+            rate = (i + 1) / elapsed
+            remaining = (n_samples - i - 1) / rate if rate > 0 else 0
+            progress = (i + 1) / n_samples * 100
+            print(f"  Progress: {i+1}/{n_samples} ({progress:.1f}%) - "
+                  f"Rate: {rate:.2f} samples/sec - "
+                  f"ETA: {remaining/60:.1f} min")
+    
+    elapsed = time.time() - start_time
     print(f"✓ Generated {len(dataset)} samples in {elapsed/60:.1f} minutes")
     print(f"  Average: {elapsed/len(dataset):.2f} sec/sample")
     

@@ -17,7 +17,7 @@ from data_generation.synthetic_data import SyntheticDataGenerator
 class DataCache:
     """Load cached datasets."""
     
-    def __init__(self, cache_dir: str = "data_cache"):
+    def __init__(self, cache_dir: str = "data"):
         self.cache_dir = cache_dir
     
     def get_cache_path(self, split: str, N: int, K: int, n_samples: int, 
@@ -397,7 +397,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
             val_data = cache.load("val", N, K, n_val, n_theta_samples, 123)
             print()
         except FileNotFoundError as e:
-            print(f"\n Error: {e}")
+            print(f"\n Error: {e}")
             print("\nPlease generate data first:")
             print("  python generate_data.py --split both --parallel")
             raise

@@ -56,7 +56,7 @@ dad_mocu_kuramoto/
 ├── configs/
 │   ├── config.yaml         # Full configuration
 │   └── config_fast.yaml    # Fast configuration (for testing)
-├── data_cache/             # Generated training data (reusable)
+├── data/                   # Generated training data (reusable)
 ├── models/                 # Trained models
 │   ├── mpnn_surrogate.pth
 │   ├── fixed_design.pkl
