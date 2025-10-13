@@ -7,7 +7,7 @@ GPU-accelerated sequential experiment design for learning coupling structures in
 ### Problem Formulation
 Given a network of coupled Kuramoto oscillators:
 
-$\dot{\theta}_i = \omega_i + \sum_{j} a_{ij}\sin(\theta_j - \theta_i) + a_{\text{ctrl}}\sin(\theta_c - \theta_i)$
+$$\dot{\theta}_i = \omega_i + \sum_{j} a_{ij}\sin(\theta_j - \theta_i) + a_{\text{ctrl}}\sin(\theta_c - \theta_i)$$
 
 **Objective**: Minimize the pacemaker control parameter $a_{\text{ctrl}}^*$ needed to synchronize the network, under uncertainty about coupling strengths $a_{ij}$.
 
