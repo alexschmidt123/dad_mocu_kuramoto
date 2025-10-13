@@ -195,7 +195,7 @@ Examples:
     )
     print("\n✓ Surrogate training complete\n")
     
-    # Step 2: Train DAD Policy
+    # Step 2: Train DAD Policy & Generate Fixed Design
     if cfg.get("enable_dad", True):
         print("STEP 2/3: Training DAD Policy via Behavior Cloning")
         print("="*80)
@@ -214,14 +214,38 @@ Examples:
         torch.save(policy.state_dict(), "trained_dad_policy.pth")
         print("\n✓ DAD policy training complete\n")
         
+        # Generate fixed design sequence (optimal for average case)
+        print("Generating fixed design sequence...")
+        representative_env = env_factory()
+        fixed_sequence = []
+        for _ in range(cfg["K"]):
+            cands = representative_env.candidate_pairs()
+            xi = choose_next_pair_greedy(representative_env, cands)
+            fixed_sequence.append(xi)
+            representative_env.step(xi)
+        print(f"✓ Fixed sequence: {fixed_sequence}\n")
+        
         strategies = {
             "Random": random_chooser,
+            "Fixed Design": fixed_design_chooser_factory(fixed_sequence),
             "Greedy MPNN": greedy_chooser,
             "DAD": dad_chooser_factory(policy),
         }
     else:
+        # Generate fixed design even without DAD
+        print("Generating fixed design sequence...")
+        representative_env = make_env_factory(cfg, surrogate=surrogate)()
+        fixed_sequence = []
+        for _ in range(cfg["K"]):
+            cands = representative_env.candidate_pairs()
+            xi = choose_next_pair_greedy(representative_env, cands)
+            fixed_sequence.append(xi)
+            representative_env.step(xi)
+        print(f"✓ Fixed sequence: {fixed_sequence}\n")
+        
         strategies = {
             "Random": random_chooser,
+            "Fixed Design": fixed_design_chooser_factory(fixed_sequence),
             "Greedy MPNN": greedy_chooser,
         }
     
