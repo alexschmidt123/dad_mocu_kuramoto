@@ -1,0 +1,54 @@
+# Fast Configuration for Quick Testing (~30 minutes total)
+# Use this for development and debugging
+
+N: 5
+K: 4
+seed: 42
+
+prior_lower: 0.05
+prior_upper: 0.50
+
+omega:
+  kind: "uniform"
+  low: -1.0
+  high: 1.0
+
+sim:
+  dt: 0.01
+  T: 3.0              # Reduced from 5.0
+  burn_in: 1.0        # Reduced from 2.0
+  R_target: 0.95
+  method: "RK45"
+  n_trajectories: 2   # Reduced from 3
+
+surrogate:
+  hidden: 128
+  dropout: 0.1
+  mocu_scale: 1.0
+  n_train: 500        # Reduced from 2000
+  n_val: 100          # Reduced from 400
+  n_theta_samples: 10 # Reduced from 30 (BIGGEST SPEEDUP)
+  epochs: 50          # Reduced from 100
+  lr: 0.001
+  batch_size: 512
+
+dad_bc:
+  hidden: 128
+  epochs: 3           # Reduced from 5
+  episodes_per_epoch: 20  # Reduced from 30
+  lr: 0.001
+
+enable_dad: true
+
+advanced:
+  bisection:
+    tol: 0.002        # Relaxed from 0.001
+    max_expand: 15    # Reduced from 20
+    max_iter: 30      # Reduced from 40
+    verbose: false
+  data_gen:
+    parallel: false
+    cache_labels: true
+  eval:
+    save_trajectories: false
+    compute_diagnostics: true

@@ -1,17 +1,51 @@
 """
 Fixed training pipeline for the MPNN surrogate model.
-Properly handles graph data and trains all prediction heads.
+Uses cached data for faster iteration.
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-from torch.cuda.amp import autocast, GradScaler
-from typing import List, Dict, Tuple
+import pickle
 import os
+from typing import List, Dict, Tuple
 from surrogate.mpnn_surrogate import MPNNSurrogate
 from data_generation.synthetic_data import SyntheticDataGenerator
+
+
+class DataCache:
+    """Load cached datasets."""
+    
+    def __init__(self, cache_dir: str = "data_cache"):
+        self.cache_dir = cache_dir
+    
+    def get_cache_path(self, split: str, N: int, K: int, n_samples: int, 
+                       n_theta_samples: int, seed: int) -> str:
+        """Generate cache filename."""
+        filename = f"{split}_N{N}_K{K}_n{n_samples}_mc{n_theta_samples}_seed{seed}.pkl"
+        return os.path.join(self.cache_dir, filename)
+    
+    def exists(self, split: str, N: int, K: int, n_samples: int, 
+              n_theta_samples: int, seed: int) -> bool:
+        """Check if cached data exists."""
+        path = self.get_cache_path(split, N, K, n_samples, n_theta_samples, seed)
+        return os.path.exists(path)
+    
+    def load(self, split: str, N: int, K: int, n_samples: int, 
+            n_theta_samples: int, seed: int) -> List[Dict]:
+        """Load dataset from cache."""
+        path = self.get_cache_path(split, N, K, n_samples, n_theta_samples, seed)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Cached data not found: {path}\n"
+                f"Run: python generate_data.py --config <config> --split {split}"
+            )
+        
+        with open(path, 'rb') as f:
+            dataset = pickle.load(f)
+        print(f" Loaded {len(dataset)} samples from cache: {path}")
+        return dataset
 
 
 class SurrogateTrainer:
@@ -47,13 +81,9 @@ class SurrogateTrainer:
         data = []
         for exp_data in dataset:
             belief_graph = exp_data['final_belief_graph']
-            # Extract A_min from belief graph edges (lower bounds)
-            # We'll compute it from the experiment data
             omega = exp_data['omega']
             
             for a_ctrl, sync_label in exp_data['sync_scores'].items():
-                # We need to pass A_min, but we'll encode it in the model differently
-                # For now, pass omega and let the model learn from belief_graph
                 data.append((belief_graph, omega, a_ctrl, sync_label))
         return data
     
@@ -77,7 +107,6 @@ class SurrogateTrainer:
             epoch_loss = 0.0
             n_batches = 0
             
-            # Shuffle training data
             indices = np.random.permutation(len(train_samples))
             
             for batch_start in range(0, len(train_samples), batch_size):
@@ -86,7 +115,6 @@ class SurrogateTrainer:
                 
                 optimizer.zero_grad()
                 
-                # Process each sample in batch (graphs can't be easily batched)
                 predictions = []
                 labels = []
                 
@@ -157,7 +185,6 @@ class SurrogateTrainer:
         val_losses = []
         
         for epoch in range(epochs):
-            # Training
             self.model.train()
             epoch_loss = 0.0
             n_batches = 0
@@ -191,7 +218,6 @@ class SurrogateTrainer:
             avg_train_loss = epoch_loss / n_batches
             train_losses.append(avg_train_loss)
             
-            # Validation
             if val_samples:
                 self.model.eval()
                 val_loss = 0.0
@@ -240,7 +266,6 @@ class SurrogateTrainer:
         val_losses = []
         
         for epoch in range(epochs):
-            # Training
             self.model.train()
             epoch_loss = 0.0
             n_batches = 0
@@ -257,7 +282,6 @@ class SurrogateTrainer:
                 labels = []
                 
                 for belief_graph, omega, a_ctrl, sync_label in batch_samples:
-                    # Create dummy A_min (will be ignored in current implementation)
                     A_min = np.zeros((len(omega), len(omega)))
                     pred = self.model.forward_sync(A_min, a_ctrl, belief_graph)
                     predictions.append(pred)
@@ -276,7 +300,6 @@ class SurrogateTrainer:
             avg_train_loss = epoch_loss / n_batches
             train_losses.append(avg_train_loss)
             
-            # Validation
             if val_samples:
                 self.model.eval()
                 val_loss = 0.0
@@ -318,15 +341,12 @@ class SurrogateTrainer:
         print("Training all surrogate model heads...")
         print("="*80)
         
-        # Train MOCU head (most important)
         mocu_results = self.train_mocu(train_data, val_data, epochs, lr, batch_size)
         print()
         
-        # Train ERM head
         erm_results = self.train_erm(train_data, val_data, epochs, lr, batch_size)
         print()
         
-        # Train Sync head
         sync_results = self.train_sync(train_data, val_data, epochs, lr, batch_size)
         print()
         
@@ -344,11 +364,13 @@ class SurrogateTrainer:
 def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: int = 200,
                          n_theta_samples: int = 20, epochs: int = 50, lr: float = 1e-3, 
                          batch_size: int = 32, device: str = None, 
-                         save_path: str = 'trained_surrogate.pth'):
-    """Complete training pipeline for the surrogate model."""
+                         save_path: str = 'trained_surrogate.pth',
+                         use_cache: bool = True):
+    """Complete training pipeline - uses cached data if available."""
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f"✓ Auto-detected device: {device}")
+        print(f" Auto-detected device: {device}")
+    
     print("="*80)
     print("SURROGATE MODEL TRAINING PIPELINE")
     print("="*80)
@@ -357,24 +379,48 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     print(f"  Training samples: {n_train}, Validation samples: {n_val}")
     print(f"  MOCU/ERM estimation samples: {n_theta_samples}")
     print(f"  Epochs: {epochs}, Learning rate: {lr}")
+    print(f"  Use cached data: {use_cache}")
     print("="*80)
     print()
     
-    # Generate training data
-    print("Generating training data...")
-    train_generator = SyntheticDataGenerator(
-        N=N, K=K, n_samples=n_train, n_theta_samples=n_theta_samples
-    )
-    train_data = train_generator.generate_dataset(seed=42)
-    print()
+    # Load data
+    cache = DataCache()
     
-    # Generate validation data
-    print("Generating validation data...")
-    val_generator = SyntheticDataGenerator(
-        N=N, K=K, n_samples=n_val, n_theta_samples=n_theta_samples
-    )
-    val_data = val_generator.generate_dataset(seed=123)
-    print()
+    if use_cache:
+        # Try to load from cache
+        try:
+            print("Loading training data from cache...")
+            train_data = cache.load("train", N, K, n_train, n_theta_samples, 42)
+            print()
+            
+            print("Loading validation data from cache...")
+            val_data = cache.load("val", N, K, n_val, n_theta_samples, 123)
+            print()
+        except FileNotFoundError as e:
+            print(f"\n Error: {e}")
+            print("\nPlease generate data first:")
+            print("  python generate_data.py --split both --parallel")
+            raise
+    else:
+        # Generate data on-the-fly (fallback)
+        print("� Generating data on-the-fly (not using cache)...")
+        print("This will be slow. Consider using generate_data.py instead.\n")
+        
+        from data_generation.synthetic_data import SyntheticDataGenerator
+        
+        print("Generating training data...")
+        train_generator = SyntheticDataGenerator(
+            N=N, K=K, n_samples=n_train, n_theta_samples=n_theta_samples
+        )
+        train_data = train_generator.generate_dataset(seed=42)
+        print()
+        
+        print("Generating validation data...")
+        val_generator = SyntheticDataGenerator(
+            N=N, K=K, n_samples=n_val, n_theta_samples=n_theta_samples
+        )
+        val_data = val_generator.generate_dataset(seed=123)
+        print()
     
     # Initialize model
     print("Initializing model...")
@@ -387,20 +433,21 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     results = trainer.train_all(train_data, val_data, epochs, lr, batch_size)
     
     # Save model
-    print(f"Saving model to {save_path}...")
-    torch.save(model.state_dict(), save_path)
-    print(" Model saved successfully!")
-    print()
+    if save_path:
+        print(f"Saving model to {save_path}...")
+        torch.save(model.state_dict(), save_path)
+        print(" Model saved successfully!")
+        print()
     
     return model, results
 
 
 if __name__ == "__main__":
-    # Train a small model for testing
-    print("Testing fixed surrogate training...")
+    print("Testing surrogate training with cached data...")
     model, results = train_surrogate_model(
         N=5, K=4, n_train=100, n_val=20, n_theta_samples=10, 
-        epochs=20, device=None, save_path='test_surrogate.pth'
+        epochs=20, device=None, save_path='test_surrogate.pth',
+        use_cache=True
     )
     print("\n Training completed successfully!")
     print(f"Final MOCU train loss: {results['mocu']['train_losses'][-1]:.4f}")
