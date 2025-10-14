@@ -65,7 +65,7 @@ def plot_mocu_curves(comparison_results: Dict[str, Dict], save_path: str = None)
             mean_curve = np.mean(curves_array, axis=0)
             std_curve = np.std(curves_array, axis=0)
             
-            steps = np.arange(len(mean_curve))
+            steps = np.arange(1, len(mean_curve) + 1)  # Start from 1, not 0
             plt.plot(steps, mean_curve, label=strategy_name, linewidth=2)
             plt.fill_between(steps, mean_curve - std_curve, mean_curve + std_curve, alpha=0.3)
     
