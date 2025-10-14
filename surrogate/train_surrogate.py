@@ -449,7 +449,11 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     
     # Initialize model
     print("Initializing model...")
-    model = MPNNSurrogate(mocu_scale=cfg.get("mocu_scale", 1.0),hidden=cfg["hidden"], dropout=cfg["dropout"])
+    model = MPNNSurrogate(
+        mocu_scale=mocu_scale,
+        hidden=hidden,
+        dropout=dropout
+    )
     trainer = SurrogateTrainer(model, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
     print()

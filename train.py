@@ -97,7 +97,10 @@ def train_surrogate(cfg: Dict, device: str, models_dir: str, force: bool = False
         batch_size=cfg["surrogate"]["batch_size"],
         device=device,
         save_path=model_path,
-        use_cache=True
+        use_cache=True,
+        hidden=cfg["surrogate"]["hidden"],
+        dropout=cfg["surrogate"]["dropout"],
+        mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0)
     )
     
     print(f"Surrogate model saved to {model_path}")
