@@ -1,5 +1,5 @@
 """
-Improved MPNN surrogate model with better architecture.
+Improved MPNN surrogate model with proper device handling.
 Fixed sync head to properly use A_min information.
 """
 
@@ -53,7 +53,6 @@ class MPNNSurrogate(nn.Module):
         self.head_erm = ImprovedMLP(din=2*hidden + 2, dout=1, hidden=hidden, dropout=dropout)
         
         # Sync head: needs to incorporate matrix information
-        # We'll encode A_min edges as additional features
         self.matrix_encoder = ImprovedMLP(din=1, dout=hidden//2, hidden=hidden//2, dropout=dropout)
         self.head_sync = ImprovedMLP(din=2*hidden + hidden//2 + 1, dout=1, hidden=hidden, dropout=dropout)
         
@@ -62,13 +61,18 @@ class MPNNSurrogate(nn.Module):
     
     def _aggregate(self, node_feats, edge_feats, edge_index):
         """Aggregate node and edge features into graph-level representation."""
-        device = node_feats.device
+        device = next(self.parameters()).device  # Get model device
+        
+        # Move inputs to model device
+        node_feats = node_feats.to(device)
+        edge_feats = edge_feats.to(device)
+        
         nN = node_feats.shape[0]
         nE = edge_feats.shape[0]
         
         # Encode features
         hn = self.node_encoder(node_feats)  # (N, hidden)
-        he = self.edge_encoder(edge_feats) if nE > 0 else torch.zeros((0, self.hidden), device=device)  # (E, hidden)
+        he = self.edge_encoder(edge_feats) if nE > 0 else torch.zeros((0, self.hidden), device=device)
         
         # Global pooling (mean)
         g_node = hn.mean(dim=0, keepdim=True)  # (1, hidden)
@@ -78,9 +82,11 @@ class MPNNSurrogate(nn.Module):
     
     def forward_mocu(self, belief_graph: dict) -> torch.Tensor:
         """Predict MOCU from belief graph."""
-        node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float32)
-        edge = torch.as_tensor(belief_graph["edge_feats"], dtype=torch.float32)
-        idx = torch.as_tensor(belief_graph["edge_index"], dtype=torch.long)
+        device = next(self.parameters()).device
+        
+        node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float32, device=device)
+        edge = torch.as_tensor(belief_graph["edge_feats"], dtype=torch.float32, device=device)
+        idx = torch.as_tensor(belief_graph["edge_index"], dtype=torch.long, device=device)
         
         g = self._aggregate(node, edge, idx)
         y = self.head_mocu(g)
@@ -90,16 +96,19 @@ class MPNNSurrogate(nn.Module):
     
     def forward_erm(self, belief_graph: dict, xi: tuple) -> torch.Tensor:
         """Predict ERM for a candidate experiment xi."""
-        node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float32)
-        edge = torch.as_tensor(belief_graph["edge_feats"], dtype=torch.float32)
-        idx = torch.as_tensor(belief_graph["edge_index"], dtype=torch.long)
+        device = next(self.parameters()).device
+        
+        node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float32, device=device)
+        edge = torch.as_tensor(belief_graph["edge_feats"], dtype=torch.float32, device=device)
+        idx = torch.as_tensor(belief_graph["edge_index"], dtype=torch.long, device=device)
         
         g = self._aggregate(node, edge, idx)
         
         # Encode candidate pair
         N = node.shape[0]
         i, j = xi
-        cand = torch.tensor([[float(i) / (N - 1 + 1e-9), float(j) / (N - 1 + 1e-9)]], dtype=torch.float32)
+        cand = torch.tensor([[float(i) / (N - 1 + 1e-9), float(j) / (N - 1 + 1e-9)]], 
+                           dtype=torch.float32, device=device)
         
         z = torch.cat([g, cand], dim=-1)
         return F.softplus(self.head_erm(z))
@@ -107,18 +116,17 @@ class MPNNSurrogate(nn.Module):
     def forward_sync(self, A_min: np.ndarray, a_ctrl: float, belief_graph: dict) -> torch.Tensor:
         """
         Predict synchronization probability given A_min matrix and control parameter.
-        
-        Now properly uses A_min information by encoding edge values.
         """
-        node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float32)
-        edge = torch.as_tensor(belief_graph["edge_feats"], dtype=torch.float32)
-        idx = torch.as_tensor(belief_graph["edge_index"], dtype=torch.long)
+        device = next(self.parameters()).device
+        
+        node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float32, device=device)
+        edge = torch.as_tensor(belief_graph["edge_feats"], dtype=torch.float32, device=device)
+        idx = torch.as_tensor(belief_graph["edge_index"], dtype=torch.long, device=device)
         
         # Aggregate belief graph features
         g = self._aggregate(node, edge, idx)
         
         # Encode A_min matrix information
-        # Extract lower triangle values (symmetric matrix)
         N = A_min.shape[0]
         a_min_values = []
         for i in range(N):
@@ -126,13 +134,13 @@ class MPNNSurrogate(nn.Module):
                 a_min_values.append(A_min[i, j])
         
         if a_min_values:
-            a_min_tensor = torch.tensor(a_min_values, dtype=torch.float32).unsqueeze(1)  # (E, 1)
-            matrix_encoding = self.matrix_encoder(a_min_tensor).mean(dim=0, keepdim=True)  # (1, hidden//2)
+            a_min_tensor = torch.tensor(a_min_values, dtype=torch.float32, device=device).unsqueeze(1)
+            matrix_encoding = self.matrix_encoder(a_min_tensor).mean(dim=0, keepdim=True)
         else:
-            matrix_encoding = torch.zeros((1, self.hidden//2))
+            matrix_encoding = torch.zeros((1, self.hidden//2), device=device)
         
         # Encode control parameter
-        u = torch.tensor([[a_ctrl]], dtype=torch.float32)
+        u = torch.tensor([[a_ctrl]], dtype=torch.float32, device=device)
         
         # Concatenate all features
         z = torch.cat([g, matrix_encoding, u], dim=-1)
@@ -141,7 +149,7 @@ class MPNNSurrogate(nn.Module):
         return torch.sigmoid(self.head_sync(z))
 
 
-# For backward compatibility, keep old class name
+# For backward compatibility
 class TinyMLP(nn.Module):
     """Legacy MLP - use ImprovedMLP for new code."""
     def __init__(self, din, dout, hidden=64):
@@ -174,6 +182,11 @@ if __name__ == "__main__":
     
     # Create model
     model = MPNNSurrogate(mocu_scale=1.0, hidden=64)
+    
+    # Test on GPU if available
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = model.to(device)
+    print(f"Testing on device: {device}")
     
     # Test MOCU prediction
     mocu_pred = model.forward_mocu(belief_graph)

@@ -1,25 +1,6 @@
 #!/usr/bin/env python3
 """
-Evaluation script for Kuramoto experiment design methods.
-
-Automatically scans models/ directory and evaluates all available methods:
-- Random (no model needed)
-- Fixed Design (if fixed_design.pkl exists)
-- Greedy MPNN (if mpnn_surrogate.pth exists)
-- DAD (if dad_policy.pth exists)
-
-Usage:
-  # Evaluate all models in models/ directory
-  python test.py --config configs/config.yaml --episodes 50
-  
-  # Quick test
-  python test.py --config configs/config_fast.yaml --episodes 10
-  
-  # Save results
-  python test.py --episodes 50 --save-results results.json
-  
-  # Custom models directory
-  python test.py --models-dir my_models/ --episodes 50
+Evaluation script with progress bars for Kuramoto experiment design methods.
 """
 
 import yaml
@@ -35,10 +16,110 @@ from surrogate.mpnn_surrogate import MPNNSurrogate
 from design.greedy_erm import choose_next_pair_greedy
 from design.dad_policy import DADPolicy
 from design.train_bc import make_hist_tokens
-from eval.run_eval import compare_strategies
+from eval.run_eval import run_episode
 from eval.metrics import (print_comparison_results, plot_mocu_curves, 
                          plot_a_ctrl_distribution, save_results, 
                          compute_improvement_metrics)
+
+# Try to import tqdm
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
+
+def run_multiple_episodes_with_progress(env_factory, chooser_fn, sim_opts, n_episodes=10, 
+                                       strategy_name="Strategy", verbose=False, seed=None):
+    """Run multiple episodes with progress bar."""
+    if seed is not None:
+        np.random.seed(seed)
+    
+    results = []
+    
+    if TQDM_AVAILABLE:
+        pbar = tqdm(range(n_episodes), desc=f"Evaluating {strategy_name}", 
+                   unit="episode", ncols=100,
+                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        
+        for episode in pbar:
+            env = env_factory()
+            result = run_episode(env, chooser_fn, sim_opts, verbose=verbose)
+            results.append(result)
+        
+        pbar.close()
+    else:
+        print(f"\nEvaluating {strategy_name}: {n_episodes} episodes")
+        for episode in range(n_episodes):
+            if (episode + 1) % 10 == 0 or (episode + 1) == n_episodes:
+                progress = (episode + 1) / n_episodes * 100
+                print(f"  [{progress:5.1f}%] {episode+1}/{n_episodes} episodes")
+            
+            env = env_factory()
+            result = run_episode(env, chooser_fn, sim_opts, verbose=verbose)
+            results.append(result)
+    
+    return results
+
+
+def compute_statistics(results: List[Dict]) -> Dict[str, Any]:
+    """Compute statistics from multiple episode results."""
+    a_ctrl_stars = [r['a_ctrl_star'] for r in results]
+    terminal_mocus = [r['terminal_mocu_hat'] for r in results if r['terminal_mocu_hat'] is not None]
+    total_times = [r['total_time'] for r in results]
+    
+    stats = {
+        'n_episodes': len(results),
+        'a_ctrl_star': {
+            'mean': np.mean(a_ctrl_stars),
+            'std': np.std(a_ctrl_stars),
+            'min': np.min(a_ctrl_stars),
+            'max': np.max(a_ctrl_stars),
+            'median': np.median(a_ctrl_stars)
+        },
+        'terminal_mocu': {
+            'mean': np.mean(terminal_mocus) if terminal_mocus else None,
+            'std': np.std(terminal_mocus) if terminal_mocus else None,
+            'min': np.min(terminal_mocus) if terminal_mocus else None,
+            'max': np.max(terminal_mocus) if terminal_mocus else None,
+            'median': np.median(terminal_mocus) if terminal_mocus else None
+        },
+        'total_time': {
+            'mean': np.mean(total_times),
+            'std': np.std(total_times),
+            'min': np.min(total_times),
+            'max': np.max(total_times)
+        }
+    }
+    
+    return stats
+
+
+def compare_strategies_with_progress(env_factory, strategies: Dict, sim_opts, 
+                                     n_episodes=10, verbose=False, seed=None):
+    """Compare multiple strategies with progress bars."""
+    if seed is not None:
+        np.random.seed(seed)
+    
+    comparison_results = {}
+    
+    print("\n" + "="*80)
+    print(f"RUNNING EVALUATION ({n_episodes} episodes per strategy)")
+    print("="*80)
+    
+    for strategy_name, chooser_fn in strategies.items():
+        results = run_multiple_episodes_with_progress(
+            env_factory, chooser_fn, sim_opts, 
+            n_episodes, strategy_name=strategy_name, 
+            verbose=False, seed=None
+        )
+        stats = compute_statistics(results)
+        comparison_results[strategy_name] = {
+            'results': results,
+            'statistics': stats
+        }
+    
+    return comparison_results
 
 
 def load_config(path: str) -> Dict[str, Any]:
@@ -65,7 +146,7 @@ def make_env_factory(cfg: Dict, surrogate, seed=0):
 
 
 def random_chooser(env, cands):
-    """Random baseline (no model needed)."""
+    """Random baseline."""
     return cands[np.random.randint(len(cands))]
 
 
@@ -108,7 +189,7 @@ def scan_models(models_dir: str, cfg: Dict, device: str) -> Dict:
     print(f"Models directory: {models_dir}")
     
     if not os.path.exists(models_dir):
-        print(f"⚠ Models directory not found: {models_dir}")
+        print(f"WARNING: Models directory not found: {models_dir}")
         print("Run train.py first to generate models")
         return {}
     
@@ -117,41 +198,39 @@ def scan_models(models_dir: str, cfg: Dict, device: str) -> Dict:
     # Check for MPNN Surrogate
     surrogate_path = os.path.join(models_dir, "mpnn_surrogate.pth")
     if os.path.exists(surrogate_path):
-        print(f"✓ Found: mpnn_surrogate.pth")
+        print(f"Found: mpnn_surrogate.pth")
         surrogate = MPNNSurrogate(
             mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
-            hidden=cfg["surrogate"]["hidden"],
+            hidden=cfg["surrogate"]["hidden"],  # Get from config, not hardcoded!
             dropout=cfg["surrogate"]["dropout"]
         )
-        surrogate.load_state_dict(torch.load(surrogate_path, map_location=device))
+        surrogate.load_state_dict(torch.load(surrogate_path, map_location=device, weights_only=True))
         surrogate.to(device)
         surrogate.eval()
         available_models["surrogate"] = surrogate
     else:
-        print(f"✗ Not found: mpnn_surrogate.pth")
-        print("  Greedy MPNN and DAD cannot be evaluated without surrogate")
+        print(f"Not found: mpnn_surrogate.pth")
     
     # Check for Fixed Design
     fixed_path = os.path.join(models_dir, "fixed_design.pkl")
     if os.path.exists(fixed_path):
-        print(f"✓ Found: fixed_design.pkl")
+        print(f"Found: fixed_design.pkl")
         with open(fixed_path, 'rb') as f:
             fixed_sequence = pickle.load(f)
         available_models["fixed_design"] = fixed_sequence
-        print(f"  Sequence: {fixed_sequence}")
     else:
-        print(f"✗ Not found: fixed_design.pkl")
+        print(f"Not found: fixed_design.pkl")
     
     # Check for DAD Policy
     dad_path = os.path.join(models_dir, "dad_policy.pth")
     if os.path.exists(dad_path):
-        print(f"✓ Found: dad_policy.pth")
+        print(f"Found: dad_policy.pth")
         policy = DADPolicy(hidden=cfg["dad_bc"]["hidden"])
         policy.load_state_dict(torch.load(dad_path, map_location='cpu'))
         policy.eval()
         available_models["dad_policy"] = policy
     else:
-        print(f"✗ Not found: dad_policy.pth")
+        print(f"Not found: dad_policy.pth")
     
     print("="*80)
     return available_models
@@ -161,20 +240,16 @@ def build_strategies(available_models: Dict) -> Dict:
     """Build strategy dictionary from available models."""
     strategies = {}
     
-    # Random is always available
     strategies["Random"] = random_chooser
     
-    # Fixed Design (if available)
     if "fixed_design" in available_models:
         strategies["Fixed Design"] = fixed_design_chooser_factory(
             available_models["fixed_design"]
         )
     
-    # Greedy MPNN (needs surrogate)
     if "surrogate" in available_models:
         strategies["Greedy MPNN"] = greedy_chooser
     
-    # DAD (needs surrogate and policy)
     if "surrogate" in available_models and "dad_policy" in available_models:
         strategies["DAD"] = dad_chooser_factory(available_models["dad_policy"])
     
@@ -183,33 +258,13 @@ def build_strategies(available_models: Dict) -> Dict:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate trained models for Kuramoto experiment design",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Evaluate all models (50 episodes)
-  python test.py --episodes 50
-  
-  # Quick test (10 episodes)
-  python test.py --episodes 10
-  
-  # Custom config and save results
-  python test.py --config configs/config_fast.yaml --episodes 50 --save-results results.json
-  
-  # Use different models directory
-  python test.py --models-dir trained_models/ --episodes 50
-        """
+        description="Evaluate trained models for Kuramoto experiment design"
     )
-    parser.add_argument("--config", default="configs/config.yaml",
-                       help="Config file")
-    parser.add_argument("--episodes", type=int, default=50,
-                       help="Number of evaluation episodes")
-    parser.add_argument("--models-dir", default="models",
-                       help="Directory containing trained models")
-    parser.add_argument("--save-results", 
-                       help="Save results to JSON file")
-    parser.add_argument("--cpu", action="store_true",
-                       help="Force CPU mode")
+    parser.add_argument("--config", default="configs/config.yaml", help="Config file")
+    parser.add_argument("--episodes", type=int, default=50, help="Number of episodes")
+    parser.add_argument("--models-dir", default="models", help="Models directory")
+    parser.add_argument("--save-results", help="Save results to JSON file")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU mode")
     
     args = parser.parse_args()
     
@@ -241,8 +296,8 @@ Examples:
     available_models = scan_models(args.models_dir, cfg, device)
     
     if not available_models:
-        print("\n✗ No models found!")
-        print("Run train.py first to generate models:")
+        print("\nERROR: No models found!")
+        print("Run train.py first:")
         print("  python train.py --methods all")
         return 1
     
@@ -255,22 +310,13 @@ Examples:
     print(f"Available strategies: {list(strategies.keys())}")
     print("="*80)
     
-    if len(strategies) == 1:
-        print("\n⚠ Only Random baseline available.")
-        print("Train more models with: python train.py --methods all")
-        print("Continuing with Random only...\n")
-    
     # Create environment factory
     surrogate = available_models.get("surrogate", None)
     env_factory = make_env_factory(cfg, surrogate=surrogate)
     
-    # Run evaluation
-    print("\n" + "="*80)
-    print(f"RUNNING EVALUATION ({args.episodes} episodes per strategy)")
-    print("="*80)
-    
+    # Run evaluation with progress bars
     try:
-        comparison_results = compare_strategies(
+        comparison_results = compare_strategies_with_progress(
             env_factory=env_factory,
             strategies=strategies,
             sim_opts=cfg["sim"],
@@ -305,27 +351,27 @@ Examples:
         print("="*80)
         try:
             plot_mocu_curves(comparison_results, save_path="mocu_curves.png")
-            print("✓ Saved: mocu_curves.png")
+            print("Saved: mocu_curves.png")
             
             plot_a_ctrl_distribution(comparison_results, 
                                     save_path="a_ctrl_distribution.png")
-            print("✓ Saved: a_ctrl_distribution.png")
+            print("Saved: a_ctrl_distribution.png")
         except Exception as e:
-            print(f"⚠ Could not generate plots: {e}")
+            print(f"WARNING: Could not generate plots: {e}")
         
         # Save results
         if args.save_results:
             save_results(comparison_results, args.save_results)
-            print(f"✓ Saved: {args.save_results}")
+            print(f"Saved: {args.save_results}")
         
         print("\n" + "="*80)
-        print("✓ EVALUATION COMPLETE")
+        print("EVALUATION COMPLETE")
         print("="*80)
         
         return 0
         
     except Exception as e:
-        print(f"\n\n✗ Error during evaluation: {e}")
+        print(f"\n\nERROR during evaluation: {e}")
         import traceback
         traceback.print_exc()
         return 1

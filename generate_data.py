@@ -327,13 +327,13 @@ def generate_dataset_parallel(N: int, K: int, n_samples: int, n_theta_samples: i
     print("Testing single sample generation...")
     test_gen = SimplifiedDataGenerator(
         N=N, K=K, prior_bounds=prior_bounds, omega_range=omega_range,
-        sim_opts=sim_opts, n_theta_samples=n_theta_samples, debug=True
+        sim_opts=sim_opts, n_theta_samples=n_theta_samples, debug=False
     )
     test_result = test_gen.generate_single_sample(seed)
     if test_result is None:
-        print(" Test sample failed! Check errors above.")
+        print("ERROR: Test sample failed! Check errors above.")
         return []
-    print(" Test sample succeeded!\n")
+    print("SUCCESS: Test sample succeeded!\n")
     
     rng = np.random.default_rng(seed)
     worker_seeds = rng.integers(0, 2**31, size=n_samples)
@@ -345,23 +345,31 @@ def generate_dataset_parallel(N: int, K: int, n_samples: int, n_theta_samples: i
     
     try:
         with Pool(n_workers, initializer=worker_init, initargs=init_args, maxtasksperchild=10) as pool:
+            # Always use tqdm-style progress bar
             if TQDM_AVAILABLE:
-                for result in tqdm(pool.imap(worker_process, worker_seeds, chunksize=5),
-                                 total=n_samples, desc="Generating", unit="sample"):
+                pbar = tqdm(total=n_samples, desc="Generating samples", 
+                           unit="sample", ncols=100,
+                           bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+                
+                for result in pool.imap(worker_process, worker_seeds, chunksize=5):
                     if result is not None:
                         dataset.append(result)
+                    pbar.update(1)
+                pbar.close()
             else:
+                # Fallback: manual progress updates every 10 samples
+                print(f"Generating {n_samples} samples...")
                 for i, result in enumerate(pool.imap(worker_process, worker_seeds, chunksize=5)):
                     if result is not None:
                         dataset.append(result)
                     
-                    if (i + 1) % 50 == 0 or (i + 1) == n_samples:
+                    if (i + 1) % 10 == 0 or (i + 1) == n_samples:
                         elapsed = time.time() - start_time
                         rate = (i + 1) / elapsed
                         remaining = (n_samples - i - 1) / rate if rate > 0 else 0
                         progress = (i + 1) / n_samples * 100
-                        print(f"  Progress: {i+1}/{n_samples} ({progress:.1f}%) - "
-                              f"Rate: {rate:.2f} samples/sec - ETA: {remaining/60:.1f} min")
+                        print(f"  [{progress:5.1f}%] {i+1}/{n_samples} samples | "
+                              f"{rate:.2f} sample/s | ETA: {remaining/60:.1f} min")
     except KeyboardInterrupt:
         print("\n\n Interrupted by user")
         raise
@@ -372,7 +380,7 @@ def generate_dataset_parallel(N: int, K: int, n_samples: int, n_theta_samples: i
                                           prior_bounds, omega_range, sim_opts, seed, debug)
     
     elapsed = time.time() - start_time
-    print(f" Generated {len(dataset)} valid samples in {elapsed/60:.1f} minutes")
+    print(f"\n Generated {len(dataset)} valid samples in {elapsed/60:.1f} minutes")
     if len(dataset) > 0:
         print(f"  Average: {elapsed/len(dataset):.2f} sec/sample")
     
@@ -399,25 +407,30 @@ def generate_dataset_sequential(N: int, K: int, n_samples: int, n_theta_samples:
     start_time = time.time()
     
     if TQDM_AVAILABLE:
-        iterator = tqdm(worker_seeds, desc="Generating", unit="sample")
+        pbar = tqdm(worker_seeds, desc="Generating samples", unit="sample", ncols=100,
+                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
+        for s in pbar:
+            result = generator.generate_single_sample(s)
+            if result is not None:
+                dataset.append(result)
+        pbar.close()
     else:
-        iterator = worker_seeds
-    
-    for i, s in enumerate(iterator):
-        result = generator.generate_single_sample(s)
-        if result is not None:
-            dataset.append(result)
-        
-        if not TQDM_AVAILABLE and ((i + 1) % 50 == 0 or (i + 1) == n_samples):
-            elapsed = time.time() - start_time
-            rate = (i + 1) / elapsed
-            remaining = (n_samples - i - 1) / rate if rate > 0 else 0
-            progress = (i + 1) / n_samples * 100
-            print(f"  Progress: {i+1}/{n_samples} ({progress:.1f}%) - "
-                  f"Rate: {rate:.2f} samples/sec - ETA: {remaining/60:.1f} min")
+        print(f"Generating {n_samples} samples...")
+        for i, s in enumerate(worker_seeds):
+            result = generator.generate_single_sample(s)
+            if result is not None:
+                dataset.append(result)
+            
+            if (i + 1) % 10 == 0 or (i + 1) == n_samples:
+                elapsed = time.time() - start_time
+                rate = (i + 1) / elapsed
+                remaining = (n_samples - i - 1) / rate if rate > 0 else 0
+                progress = (i + 1) / n_samples * 100
+                print(f"  [{progress:5.1f}%] {i+1}/{n_samples} samples | "
+                      f"{rate:.2f} sample/s | ETA: {remaining/60:.1f} min")
     
     elapsed = time.time() - start_time
-    print(f" Generated {len(dataset)} samples in {elapsed/60:.1f} minutes")
+    print(f"\n Generated {len(dataset)} samples in {elapsed/60:.1f} minutes")
     
     return dataset
 
@@ -499,7 +512,7 @@ def main():
         print("="*80)
         
         if not args.force and cache.exists("val", N, K, n_val, n_theta_samples, 123):
-            print(" Found cached validation data")
+            print("� Found cached validation data")
             val_data = cache.load("val", N, K, n_val, n_theta_samples, 123)
         else:
             if args.parallel:

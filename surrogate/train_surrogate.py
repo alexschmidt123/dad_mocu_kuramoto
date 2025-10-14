@@ -13,6 +13,13 @@ from typing import List, Dict, Tuple
 from surrogate.mpnn_surrogate import MPNNSurrogate
 from data_generation.synthetic_data import SyntheticDataGenerator
 
+# Try to import tqdm
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
 
 class DataCache:
     """Load cached datasets."""
@@ -101,7 +108,10 @@ class SurrogateTrainer:
         train_losses = []
         val_losses = []
         
-        for epoch in range(epochs):
+        # Progress bar for epochs
+        epoch_iter = tqdm(range(epochs), desc="MOCU Training", ncols=100) if TQDM_AVAILABLE else range(epochs)
+        
+        for epoch in epoch_iter:
             # Training
             self.model.train()
             epoch_loss = 0.0
@@ -119,7 +129,13 @@ class SurrogateTrainer:
                 labels = []
                 
                 for belief_graph, mocu_label in batch_samples:
-                    pred = self.model.forward_mocu(belief_graph)
+                    # Move belief graph to device
+                    belief_graph_gpu = {
+                        'node_feats': belief_graph['node_feats'],
+                        'edge_feats': belief_graph['edge_feats'],
+                        'edge_index': belief_graph['edge_index']
+                    }
+                    pred = self.model.forward_mocu(belief_graph_gpu)
                     predictions.append(pred)
                     labels.append(mocu_label)
                 
@@ -164,9 +180,18 @@ class SurrogateTrainer:
                 avg_val_loss = val_loss / n_val_batches
                 val_losses.append(avg_val_loss)
             
-            if (epoch + 1) % 10 == 0:
+            # Update progress bar
+            if TQDM_AVAILABLE:
+                desc = f"MOCU Training - Loss: {avg_train_loss:.4f}"
+                if val_losses:
+                    desc += f" | Val: {val_losses[-1]:.4f}"
+                epoch_iter.set_description(desc)
+            elif (epoch + 1) % 10 == 0:
                 val_str = f", Val Loss = {val_losses[-1]:.4f}" if val_losses else ""
                 print(f"Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.4f}{val_str}")
+        
+        if TQDM_AVAILABLE:
+            epoch_iter.close()
         
         return {'train_losses': train_losses, 'val_losses': val_losses}
     
@@ -369,7 +394,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     """Complete training pipeline - uses cached data if available."""
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        print(f" Auto-detected device: {device}")
+        print(f"Auto-detected device: {device}")
     
     print("="*80)
     print("SURROGATE MODEL TRAINING PIPELINE")
