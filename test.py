@@ -199,12 +199,42 @@ def scan_models(models_dir: str, cfg: Dict, device: str) -> Dict:
     surrogate_path = os.path.join(models_dir, "mpnn_surrogate.pth")
     if os.path.exists(surrogate_path):
         print(f"Found: mpnn_surrogate.pth")
-        surrogate = MPNNSurrogate(
-            mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
-            hidden=cfg["surrogate"]["hidden"],  # Get from config, not hardcoded!
-            dropout=cfg["surrogate"]["dropout"]
-        )
-        surrogate.load_state_dict(torch.load(surrogate_path, map_location=device, weights_only=True))
+        
+        # Try to load with config parameters first
+        try:
+            surrogate = MPNNSurrogate(
+                mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
+                hidden=cfg["surrogate"]["hidden"],
+                dropout=cfg["surrogate"]["dropout"]
+            )
+            surrogate.load_state_dict(torch.load(surrogate_path, map_location=device, weights_only=True))
+            print(f"✓ Loaded with config parameters (hidden={cfg['surrogate']['hidden']})")
+        except RuntimeError as e:
+            if "size mismatch" in str(e):
+                print(f"⚠ Architecture mismatch detected. Trying to detect saved model architecture...")
+                
+                # Load the state dict to inspect the architecture
+                state_dict = torch.load(surrogate_path, map_location=device, weights_only=True)
+                
+                # Detect hidden size from the first layer
+                first_layer_weight = state_dict['node_encoder.net.0.weight']
+                detected_hidden = first_layer_weight.shape[0]
+                
+                print(f"Detected saved model architecture: hidden={detected_hidden}")
+                print(f"Config architecture: hidden={cfg['surrogate']['hidden']}")
+                print(f"Creating model with detected architecture...")
+                
+                # Create model with detected architecture
+                surrogate = MPNNSurrogate(
+                    mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
+                    hidden=detected_hidden,
+                    dropout=cfg["surrogate"]["dropout"]
+                )
+                surrogate.load_state_dict(state_dict)
+                print(f"✓ Loaded with detected parameters (hidden={detected_hidden})")
+            else:
+                raise e
+        
         surrogate.to(device)
         surrogate.eval()
         available_models["surrogate"] = surrogate
