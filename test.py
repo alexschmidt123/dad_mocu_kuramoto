@@ -130,9 +130,14 @@ def load_config(path: str) -> Dict[str, Any]:
 
 def make_env_factory(cfg: Dict, surrogate, seed=0):
     """Create environment factory."""
+    episode_counter = [0]  # Use list to make it mutable
+    
     def env_factory():
         N, K = cfg["N"], cfg["K"]
-        rng = np.random.default_rng(cfg["seed"] + seed)
+        # Use different seed for each episode
+        episode_seed = cfg["seed"] + seed + episode_counter[0]
+        episode_counter[0] += 1
+        rng = np.random.default_rng(episode_seed)
         
         if cfg["omega"]["kind"] == "uniform":
             omega = rng.uniform(cfg["omega"]["low"], cfg["omega"]["high"], size=N)
