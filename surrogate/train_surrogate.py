@@ -385,12 +385,12 @@ class SurrogateTrainer:
             'sync': sync_results
         }
 
-
 def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: int = 200,
                          n_theta_samples: int = 20, epochs: int = 50, lr: float = 1e-3, 
                          batch_size: int = 32, device: str = None, 
                          save_path: str = 'trained_surrogate.pth',
-                         use_cache: bool = True):
+                         use_cache: bool = True, hidden: int = 64, dropout: float = 0.1,
+                         mocu_scale: float = 1.0):
     """Complete training pipeline - uses cached data if available."""
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -428,7 +428,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
             raise
     else:
         # Generate data on-the-fly (fallback)
-        print("� Generating data on-the-fly (not using cache)...")
+        print(" Generating data on-the-fly (not using cache)...")
         print("This will be slow. Consider using generate_data.py instead.\n")
         
         from data_generation.synthetic_data import SyntheticDataGenerator
@@ -449,7 +449,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     
     # Initialize model
     print("Initializing model...")
-    model = MPNNSurrogate(mocu_scale=1.0)
+    model = MPNNSurrogate(mocu_scale=cfg.get("mocu_scale", 1.0),hidden=cfg["hidden"], dropout=cfg["dropout"])
     trainer = SurrogateTrainer(model, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
     print()
