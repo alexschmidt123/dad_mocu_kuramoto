@@ -217,8 +217,6 @@ class SimplifiedDataGenerator:
             
             # Run K experiments
             for step in range(self.K):
-                if self.debug and step == 0:
-                    print(f"  Processing step {step+1}/{self.K} for seed {seed}")
                 
                 belief_graph = build_belief_graph(h, omega)
                 current_mocu = self.compute_mocu(h, omega, rng)
@@ -323,6 +321,19 @@ def generate_dataset_parallel(N: int, K: int, n_samples: int, n_theta_samples: i
     print(f"  MC samples per sample: {n_theta_samples}")
     print(f"  Workers: {n_workers}")
     print(f"  Total cores: {cpu_count()}")
+    print()
+    
+    # Test if a single sample works first
+    print("Testing single sample generation...")
+    test_gen = SimplifiedDataGenerator(
+        N=N, K=K, prior_bounds=prior_bounds, omega_range=omega_range,
+        sim_opts=sim_opts, n_theta_samples=n_theta_samples, debug=True
+    )
+    test_result = test_gen.generate_single_sample(seed)
+    if test_result is None:
+        print(" Test sample failed! Check errors above.")
+        return []
+    print(" Test sample succeeded!\n")
     
     rng = np.random.default_rng(seed)
     worker_seeds = rng.integers(0, 2**31, size=n_samples)
@@ -332,28 +343,38 @@ def generate_dataset_parallel(N: int, K: int, n_samples: int, n_theta_samples: i
     
     init_args = (N, K, prior_bounds, omega_range, sim_opts, n_theta_samples, debug)
     
-    with Pool(n_workers, initializer=worker_init, initargs=init_args) as pool:
-        if TQDM_AVAILABLE:
-            for result in tqdm(pool.imap_unordered(worker_process, worker_seeds),
-                             total=n_samples, desc="Generating", unit="sample"):
-                if result is not None:
-                    dataset.append(result)
-        else:
-            for i, result in enumerate(pool.imap_unordered(worker_process, worker_seeds)):
-                if result is not None:
-                    dataset.append(result)
-                
-                if (i + 1) % 50 == 0 or (i + 1) == n_samples:
-                    elapsed = time.time() - start_time
-                    rate = (i + 1) / elapsed
-                    remaining = (n_samples - i - 1) / rate if rate > 0 else 0
-                    progress = (i + 1) / n_samples * 100
-                    print(f"  Progress: {i+1}/{n_samples} ({progress:.1f}%) - "
-                          f"Rate: {rate:.2f} samples/sec - ETA: {remaining/60:.1f} min")
+    try:
+        with Pool(n_workers, initializer=worker_init, initargs=init_args, maxtasksperchild=10) as pool:
+            if TQDM_AVAILABLE:
+                for result in tqdm(pool.imap(worker_process, worker_seeds, chunksize=5),
+                                 total=n_samples, desc="Generating", unit="sample"):
+                    if result is not None:
+                        dataset.append(result)
+            else:
+                for i, result in enumerate(pool.imap(worker_process, worker_seeds, chunksize=5)):
+                    if result is not None:
+                        dataset.append(result)
+                    
+                    if (i + 1) % 50 == 0 or (i + 1) == n_samples:
+                        elapsed = time.time() - start_time
+                        rate = (i + 1) / elapsed
+                        remaining = (n_samples - i - 1) / rate if rate > 0 else 0
+                        progress = (i + 1) / n_samples * 100
+                        print(f"  Progress: {i+1}/{n_samples} ({progress:.1f}%) - "
+                              f"Rate: {rate:.2f} samples/sec - ETA: {remaining/60:.1f} min")
+    except KeyboardInterrupt:
+        print("\n\n Interrupted by user")
+        raise
+    except Exception as e:
+        print(f"\n Parallel processing failed: {e}")
+        print("Falling back to sequential generation...")
+        return generate_dataset_sequential(N, K, n_samples, n_theta_samples,
+                                          prior_bounds, omega_range, sim_opts, seed, debug)
     
     elapsed = time.time() - start_time
-    print(f" Generated {len(dataset)} valid samples in {elapsed/60:.1f} minutes")
-    print(f"  Average: {elapsed/len(dataset):.2f} sec/sample")
+    print(f" Generated {len(dataset)} valid samples in {elapsed/60:.1f} minutes")
+    if len(dataset) > 0:
+        print(f"  Average: {elapsed/len(dataset):.2f} sec/sample")
     
     return dataset
 
@@ -396,7 +417,7 @@ def generate_dataset_sequential(N: int, K: int, n_samples: int, n_theta_samples:
                   f"Rate: {rate:.2f} samples/sec - ETA: {remaining/60:.1f} min")
     
     elapsed = time.time() - start_time
-    print(f" Generated {len(dataset)} samples in {elapsed/60:.1f} minutes")
+    print(f" Generated {len(dataset)} samples in {elapsed/60:.1f} minutes")
     
     return dataset
 
@@ -412,9 +433,14 @@ def main():
     parser.add_argument("--workers", type=int, default=None, help="Number of workers")
     parser.add_argument("--force", action="store_true", help="Force regenerate")
     parser.add_argument("--cache-dir", default="dataset", help="Cache directory")
-    parser.add_argument("--debug", action="store_true", help="Debug mode")
+    parser.add_argument("--debug", action="store_true", help="Debug mode (forces sequential)")
     
     args = parser.parse_args()
+    
+    # Debug mode forces sequential processing
+    if args.debug and args.parallel:
+        print("� Warning: --debug flag forces sequential mode (disabling --parallel)")
+        args.parallel = False
     
     if not os.path.exists(args.config):
         print(f"Error: Config file '{args.config}' not found!")
@@ -450,7 +476,7 @@ def main():
         print("="*80)
         
         if not args.force and cache.exists("train", N, K, n_train, n_theta_samples, 42):
-            print("� Found cached training data")
+            print(" Found cached training data")
             train_data = cache.load("train", N, K, n_train, n_theta_samples, 42)
         else:
             if args.parallel:
@@ -473,7 +499,7 @@ def main():
         print("="*80)
         
         if not args.force and cache.exists("val", N, K, n_val, n_theta_samples, 123):
-            print("� Found cached validation data")
+            print(" Found cached validation data")
             val_data = cache.load("val", N, K, n_val, n_theta_samples, 123)
         else:
             if args.parallel:
