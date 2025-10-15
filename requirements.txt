@@ -5,5 +5,15 @@ PyYAML>=6.0.0
 matplotlib>=3.5.0
 tqdm>=4.65.0
 
-# Note: PyTorch and PyCUDA are installed via conda
-# See installation instructions in README.md
+# PyTorch and PyTorch Geometric
+# Install via conda for best CUDA compatibility:
+# conda install pytorch torchvision cudatoolkit=11.8 -c pytorch
+# pip install torch-scatter torch-sparse torch-cluster -f https://data.pyg.org/whl/torch-2.0.0+cu118.html
+# pip install torch-geometric
+
+# PyCUDA (critical for GPU acceleration)
+# Install after CUDA toolkit:
+# conda install -c nvidia cuda-toolkit
+# pip install pycuda
+
+# Note: For detailed installation instructions, see README.md

@@ -112,8 +112,8 @@ pip install -r requirements.txt
 ### Quick Start (Fast Config, ~30 minutes)
 
 ```bash
-# Step 1: Generate training data with GPU acceleration (~15 min)
-python generate_data_gpu.py --config configs/config_fast.yaml --split both --parallel --workers 16 --gpu
+# Step 1: Generate training data (~15 min)
+python generate_data.py --config configs/config_fast.yaml --split both
 
 # Step 2: Train all models (~10 min)
 python train.py --config configs/config_fast.yaml --methods all
@@ -126,7 +126,7 @@ python test.py --config configs/config_fast.yaml --episodes 50
 
 ```bash
 # Step 1: Generate training data (~1.5 hours)
-python generate_data_gpu.py --config configs/config.yaml --split both --parallel --workers 16 --gpu
+python generate_data.py --config configs/config.yaml --split both
 
 # Step 2: Train all models (~20 min)
 python train.py --config configs/config.yaml --methods all
@@ -134,6 +134,7 @@ python train.py --config configs/config.yaml --methods all
 # Step 3: Evaluate (~10 min)
 python test.py --config configs/config.yaml --episodes 100 --save-results results.json
 ```
+
 
 ## References
 

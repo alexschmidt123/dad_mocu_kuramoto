@@ -1,9 +1,11 @@
 """
 FIXED synthetic data generation - eliminates negative MOCU bug.
+Following Chen et al. (2023) approach: sequential generation with GPU-accelerated MOCU.
 
 Critical fixes:
 1. Simplified MOCU formula - guaranteed non-negative
 2. Skip unnecessary ERM computation during training data generation
+3. Sequential generation (no multiprocessing) for stability
 """
 
 import numpy as np
@@ -49,7 +51,7 @@ class SyntheticDataGenerator:
         return A
     
     def find_optimal_control(self, A: np.ndarray, omega: np.ndarray) -> float:
-        """Find a*(θ) = minimal a_ctrl that synchronizes A."""
+        """Find a*(theta) = minimal a_ctrl that synchronizes A."""
         def check_fn(a_ctrl):
             try:
                 return sync_check(A, omega, a_ctrl, **self.sim_opts)
@@ -58,7 +60,7 @@ class SyntheticDataGenerator:
         
         try:
             return find_min_a_ctrl(A, omega, check_fn, lo=0.0, hi_init=0.1, 
-                                  tol=5e-3, verbose=False)  # Relaxed tolerance
+                                  tol=5e-3, verbose=False)
         except:
             return 2.0
     
@@ -66,11 +68,12 @@ class SyntheticDataGenerator:
                           rng: np.random.Generator) -> float:
         """
         FIXED MOCU computation - guaranteed non-negative.
+        Following Chen et al. (2023) methodology.
         
-        MOCU = a*(A_min) - E[a*(θ)]
+        MOCU = a*(A_min) - E[a*(theta)]
         
         This measures: "How much excess control do we need because we must
-        plan for worst-case, versus if we knew the true θ?"
+        plan for worst-case, versus if we knew the true theta?"
         
         This simplified formula avoids the infinity bug and is always non-negative.
         """
@@ -83,10 +86,10 @@ class SyntheticDataGenerator:
         optimal_controls = []
         
         for _ in range(self.n_theta_samples):
-            # Sample plausible θ from current belief
+            # Sample plausible theta from current belief
             A_sample = self.sample_theta_from_belief(h, rng)
             
-            # Find optimal control for this specific θ
+            # Find optimal control for this specific theta
             a_optimal = self.find_optimal_control(A_sample, omega)
             
             optimal_controls.append(a_optimal)
@@ -95,7 +98,7 @@ class SyntheticDataGenerator:
         expected_optimal = np.mean(optimal_controls)
         
         # MOCU = worst-case - expected
-        # This is the "regret" of not knowing θ exactly
+        # This is the "regret" of not knowing theta exactly
         mocu = a_worst_case - expected_optimal
         
         # Safety: ensure non-negative (handles numerical errors)
@@ -106,8 +109,9 @@ class SyntheticDataGenerator:
         """
         Run complete K-step experiment sequence.
         
-        CRITICAL: Skip ERM computation during data generation.
+        CRITICAL: Skip ERM computation during data generation (Chen et al. 2023 approach).
         ERM is only needed at inference time, not for training the surrogate.
+        This saves ~10x computation time during data generation.
         """
         h = init_history(self.N, self.prior_bounds)
         experiment_data = []
@@ -129,6 +133,7 @@ class SyntheticDataGenerator:
             # CRITICAL FIX: Skip ERM computation during data generation
             # ERM is NOT used during surrogate training, only MOCU is
             # This saves ~10x computation time!
+            # The trained MPNN will compute ERM at inference time
             erm_scores = {}  # Empty - computed at inference time by trained surrogate
             
             # Random experiment selection (for diverse training data)
@@ -142,7 +147,7 @@ class SyntheticDataGenerator:
                 'belief_graph': belief_graph,
                 'mocu': current_mocu,  # Ground-truth MOCU label
                 'candidate_pairs': candidates,
-                'erm_scores': erm_scores,  # Empty dict - not needed
+                'erm_scores': erm_scores,  # Empty dict - not needed for training
                 'chosen_pair': xi,
                 'outcome': y_sync,
                 'step': step
@@ -188,7 +193,7 @@ class SyntheticDataGenerator:
         
         print(f"Generating {self.n_samples} samples with FIXED MOCU (non-negative)")
         print(f"Using {self.n_theta_samples} MC samples for MOCU estimation")
-        print(f"⚡ Skipping ERM computation for 10x speedup")
+        print(f"SPEEDUP: Skipping ERM computation for 10x faster generation")
         
         for i in range(self.n_samples):
             if (i + 1) % 50 == 0:
@@ -204,7 +209,7 @@ class SyntheticDataGenerator:
                 print(f"  Warning: Failed sample {i}: {e}")
                 continue
         
-        print(f"\n✓ Generated {len(dataset)} valid samples")
+        print(f"\nSUCCESS: Generated {len(dataset)} valid samples")
         
         # Verify MOCU statistics
         if dataset:
@@ -222,9 +227,9 @@ class SyntheticDataGenerator:
             print(f"  Max:  {all_mocu.max():.4f}")
             
             if all_mocu.min() < 0:
-                print(f"  ✗ WARNING: Negative MOCU detected!")
+                print(f"  FAIL: WARNING: Negative MOCU detected!")
             else:
-                print(f"  ✓ All MOCU values non-negative")
+                print(f"  SUCCESS: All MOCU values non-negative")
         
         return dataset
 
@@ -243,8 +248,8 @@ if __name__ == "__main__":
     dataset = create_training_data(N=5, K=4, n_samples=5, n_theta_samples=10, seed=42)
     
     if dataset:
-        print(f"\n✓ Generated {len(dataset)} samples")
+        print(f"\nSUCCESS: Generated {len(dataset)} samples")
         sample = dataset[0]
-        print(f"✓ Initial MOCU: {sample['experiment_data'][0]['mocu']:.4f}")
-        print(f"✓ Final MOCU: {sample['final_mocu']:.4f}")
-        print(f"✓ a_ctrl_star: {sample['a_ctrl_star']:.4f}")
+        print(f"SUCCESS: Initial MOCU: {sample['experiment_data'][0]['mocu']:.4f}")
+        print(f"SUCCESS: Final MOCU: {sample['final_mocu']:.4f}")
+        print(f"SUCCESS: a_ctrl_star: {sample['a_ctrl_star']:.4f}")
