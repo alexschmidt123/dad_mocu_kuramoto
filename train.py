@@ -15,7 +15,6 @@ from surrogate.mpnn_surrogate import MPNNSurrogate
 from surrogate.train_surrogate import train_surrogate_model
 from design.greedy_erm import choose_next_pair_greedy
 from design.dad_policy import DADPolicy
-from design.train_rl import train_behavior_cloning
 
 
 def setup_gpu():
@@ -176,7 +175,7 @@ def train_dad_policy(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
     
     if not force and os.path.exists(model_path):
         print(f"Loading existing policy from {model_path}")
-        policy = DADPolicy(hidden=cfg["dad_bc"]["hidden"])
+        policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
         policy.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
         policy.eval()
         print("Policy loaded\n")
@@ -184,18 +183,18 @@ def train_dad_policy(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
     
     print("Training DAD policy via RL to minimize MOCU...")
     env_factory = make_env_factory(cfg, surrogate=surrogate)
-    policy = DADPolicy(hidden=cfg["dad_bc"]["hidden"])
+    policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
     
-    # Changed: Import from train_rl instead of train_bc
+    # Changed: Import from train_rl instead of train_rl
     from design.train_rl import train_dad_rl
     
     policy = train_dad_rl(
         env_factory=env_factory,
         policy=policy,
         surrogate=surrogate,
-        epochs=cfg["dad_bc"]["epochs"],
-        episodes_per_epoch=cfg["dad_bc"]["episodes_per_epoch"],
-        lr=cfg["dad_bc"]["lr"]
+        epochs=cfg["dad_rl"]["epochs"],
+        episodes_per_epoch=cfg["dad_rl"]["episodes_per_epoch"],
+        lr=cfg["dad_rl"]["lr"]
     )
     
     # Save

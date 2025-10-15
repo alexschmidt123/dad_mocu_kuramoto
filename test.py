@@ -260,7 +260,7 @@ def scan_models(models_dir: str, cfg: Dict, device: str) -> Dict:
     dad_path = os.path.join(models_dir, "dad_policy.pth")
     if os.path.exists(dad_path):
         print(f"Found: dad_policy.pth")
-        policy = DADPolicy(hidden=cfg["dad_bc"]["hidden"])
+        policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
         policy.load_state_dict(torch.load(dad_path, map_location='cpu'))
         policy.eval()
         available_models["dad_policy"] = policy

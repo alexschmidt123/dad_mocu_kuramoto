@@ -34,7 +34,7 @@ def make_env_factory(cfg, surrogate):
 def debug_single_step():
     """Debug a single training step in detail."""
     print("="*80)
-    print("DEBUGGING SINGLE BC TRAINING STEP")
+    print("DEBUGGING SINGLE RL TRAINING STEP")
     print("="*80)
     
     cfg = load_config('configs/config_fast.yaml')
@@ -53,7 +53,7 @@ def debug_single_step():
     env = env_factory()
     
     # Initialize policy (untrained)
-    policy = DADPolicy(hidden=cfg["dad_bc"]["hidden"])
+    policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
     
     print("\n1. Environment setup:")
     print(f"   N = {env.N}, K = {env.K}")
@@ -135,7 +135,7 @@ def debug_score_distribution():
     for policy_name, policy_path in [("Untrained", None), ("Trained", 'models/dad_policy.pth')]:
         print(f"\n{policy_name} Policy:")
         
-        policy = DADPolicy(hidden=cfg["dad_bc"]["hidden"])
+        policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
         if policy_path:
             try:
                 policy.load_state_dict(torch.load(policy_path, map_location='cpu'))
