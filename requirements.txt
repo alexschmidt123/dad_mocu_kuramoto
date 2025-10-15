@@ -1,12 +1,9 @@
 # Core dependencies
-# Note: Install PyTorch separately with CUDA support:
-#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
-
 numpy>=1.24.0
 scipy>=1.9.0
 PyYAML>=6.0.0
 matplotlib>=3.5.0
 tqdm>=4.65.0
 
-# GPU acceleration
-pycuda>=2022.1
+# Note: PyTorch and PyCUDA are installed via conda
+# See installation instructions in README.md

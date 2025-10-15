@@ -98,6 +98,10 @@ cd dad_mocu_kuramoto
 conda create -n dad_mocu_kuramoto python=3.9
 conda activate dad_mocu_kuramoto
 
+# Install CUDA toolkit and PyCUDA via conda
+conda install -c nvidia cuda-toolkit
+pip install pycuda
+
 # Install PyTorch with CUDA 12.1
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
