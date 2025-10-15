@@ -1,12 +1,10 @@
 """
-GPU-accelerated pacemaker control using PyCUDA.
-Following Chen et al. (2023) methodology for massive parallelization.
-
-This allows parallel ODE integration for multiple matrices simultaneously,
-dramatically speeding up MOCU computation during data generation.
+Complete GPU-accelerated pacemaker control using PyCUDA.
+Implements both GPU and CPU fallback for Kuramoto model integration.
 """
 
 import numpy as np
+from scipy.integrate import solve_ivp
 
 # Try to import PyCUDA
 try:
@@ -16,12 +14,15 @@ try:
     PYCUDA_AVAILABLE = True
 except ImportError:
     PYCUDA_AVAILABLE = False
-    print("Warning: PyCUDA not available. Falling back to CPU computation.")
+    print("Warning: PyCUDA not available. Using CPU fallback.")
 
 
-# CUDA kernel for Kuramoto model integration
+# ============================================================================
+# CUDA KERNEL for Kuramoto Model
+# ============================================================================
+
 KURAMOTO_KERNEL = """
-__device__ float order_param(float* theta, int N) {
+__device__ float compute_order_parameter(float* theta, int N) {
     float cos_sum = 0.0f;
     float sin_sum = 0.0f;
     
@@ -30,13 +31,10 @@ __device__ float order_param(float* theta, int N) {
         sin_sum += sinf(theta[i]);
     }
     
-    cos_sum /= N;
-    sin_sum /= N;
-    
-    return sqrtf(cos_sum * cos_sum + sin_sum * sin_sum);
+    return sqrtf(cos_sum * cos_sum + sin_sum * sin_sum) / N;
 }
 
-__global__ void kuramoto_step(
+__global__ void kuramoto_rk4_step(
     float* theta,           // Current phases (batch_size, N)
     float* theta_new,       // Updated phases (batch_size, N)
     float* A,              // Coupling matrices (batch_size, N, N)
@@ -55,23 +53,51 @@ __global__ void kuramoto_step(
     int base = batch_idx * N;
     int A_base = batch_idx * N * N;
     
-    // Natural frequency term
-    float dtheta = omega[base + osc_idx];
+    float theta_i = theta[base + osc_idx];
+    float omega_i = omega[base + osc_idx];
+    float a_c = a_ctrl[batch_idx];
     
-    // Coupling term
-    float coupling = 0.0f;
+    // RK4 integration
+    // k1
+    float k1 = omega_i;
     for (int j = 0; j < N; j++) {
         float a_ij = A[A_base + osc_idx * N + j];
-        float phase_diff = theta[base + j] - theta[base + osc_idx];
-        coupling += a_ij * sinf(phase_diff);
+        k1 += a_ij * sinf(theta[base + j] - theta_i);
     }
-    dtheta += coupling;
+    k1 += a_c * sinf(-theta_i);  // Pacemaker at theta_c = 0
     
-    // Pacemaker control term (pacemaker at theta_c = 0)
-    dtheta += a_ctrl[batch_idx] * sinf(-theta[base + osc_idx]);
+    // k2
+    float theta_tmp = theta_i + 0.5f * dt * k1;
+    float k2 = omega_i;
+    for (int j = 0; j < N; j++) {
+        float a_ij = A[A_base + osc_idx * N + j];
+        float theta_j_tmp = theta[base + j] + 0.5f * dt * k1;
+        k2 += a_ij * sinf(theta_j_tmp - theta_tmp);
+    }
+    k2 += a_c * sinf(-theta_tmp);
     
-    // Update phase
-    float new_theta = theta[base + osc_idx] + dt * dtheta;
+    // k3
+    theta_tmp = theta_i + 0.5f * dt * k2;
+    float k3 = omega_i;
+    for (int j = 0; j < N; j++) {
+        float a_ij = A[A_base + osc_idx * N + j];
+        float theta_j_tmp = theta[base + j] + 0.5f * dt * k2;
+        k3 += a_ij * sinf(theta_j_tmp - theta_tmp);
+    }
+    k3 += a_c * sinf(-theta_tmp);
+    
+    // k4
+    theta_tmp = theta_i + dt * k3;
+    float k4 = omega_i;
+    for (int j = 0; j < N; j++) {
+        float a_ij = A[A_base + osc_idx * N + j];
+        float theta_j_tmp = theta[base + j] + dt * k3;
+        k4 += a_ij * sinf(theta_j_tmp - theta_tmp);
+    }
+    k4 += a_c * sinf(-theta_tmp);
+    
+    // Update
+    float new_theta = theta_i + (dt / 6.0f) * (k1 + 2.0f*k2 + 2.0f*k3 + k4);
     
     // Wrap to [-pi, pi]
     while (new_theta > 3.14159265f) new_theta -= 2.0f * 3.14159265f;
@@ -91,10 +117,14 @@ __global__ void compute_order_params(
     if (batch_idx >= batch_size) return;
     
     int base = batch_idx * N;
-    R_values[batch_idx] = order_param(&theta[base], N);
+    R_values[batch_idx] = compute_order_parameter(&theta[base], N);
 }
 """
 
+
+# ============================================================================
+# GPU Simulator Class
+# ============================================================================
 
 class GPUKuramotoSimulator:
     """GPU-accelerated Kuramoto simulator using PyCUDA."""
@@ -111,7 +141,7 @@ class GPUKuramotoSimulator:
         
         # Compile CUDA kernel
         self.mod = SourceModule(KURAMOTO_KERNEL)
-        self.kuramoto_step = self.mod.get_function("kuramoto_step")
+        self.kuramoto_step = self.mod.get_function("kuramoto_rk4_step")
         self.compute_order_params = self.mod.get_function("compute_order_params")
         
         # CUDA block and grid sizes
@@ -205,21 +235,107 @@ class GPUKuramotoSimulator:
         return np.mean(R_means, axis=0)
     
     def sync_check_batch(self, A_batch, omega_batch, a_ctrl_batch, n_trajectories=1):
-        """
-        Check synchronization for a batch of systems.
-        
-        Returns:
-            sync_flags: (batch_size,) boolean array indicating if each system syncs
-        """
+        """Check synchronization for a batch of systems."""
         R_mean = self.simulate_batch(A_batch, omega_batch, a_ctrl_batch, n_trajectories)
         return R_mean >= self.R_target
 
 
+# ============================================================================
+# CPU Implementation (Fallback)
+# ============================================================================
+
+def kuramoto_ode(t, theta, A, omega, a_ctrl):
+    """ODE for Kuramoto model with pacemaker control."""
+    N = len(theta)
+    dtheta = omega.copy()
+    
+    # Coupling term
+    for i in range(N):
+        for j in range(N):
+            dtheta[i] += A[i, j] * np.sin(theta[j] - theta[i])
+    
+    # Pacemaker control (pacemaker at theta_c = 0)
+    dtheta += a_ctrl * np.sin(-theta)
+    
+    return dtheta
+
+
+def sync_check(A, omega, a_ctrl, dt=0.01, T=5.0, burn_in=2.0, 
+               R_target=0.95, method='RK45', n_trajectories=3):
+    """
+    CPU implementation: Check if system synchronizes with given control parameter.
+    
+    Args:
+        A: (N, N) coupling matrix
+        omega: (N,) natural frequencies
+        a_ctrl: control parameter
+        dt: time step (only used for recording)
+        T: total simulation time
+        burn_in: burn-in time
+        R_target: target order parameter
+        method: ODE solver method
+        n_trajectories: number of trajectories to average
+    
+    Returns:
+        bool: True if system synchronizes (R >= R_target)
+    """
+    N = A.shape[0]
+    
+    R_values = []
+    
+    for _ in range(n_trajectories):
+        # Random initial conditions
+        theta0 = np.random.uniform(-np.pi, np.pi, N)
+        
+        # Solve ODE
+        t_eval = np.arange(burn_in, T, dt)
+        
+        try:
+            sol = solve_ivp(
+                kuramoto_ode,
+                t_span=(0, T),
+                y0=theta0,
+                args=(A, omega, a_ctrl),
+                method=method,
+                t_eval=t_eval,
+                rtol=1e-6,
+                atol=1e-8
+            )
+            
+            if not sol.success:
+                return False
+            
+            # Compute order parameters after burn-in
+            theta_trajectory = sol.y  # (N, n_timepoints)
+            
+            R_trajectory = []
+            for t_idx in range(theta_trajectory.shape[1]):
+                theta = theta_trajectory[:, t_idx]
+                cos_sum = np.sum(np.cos(theta))
+                sin_sum = np.sum(np.sin(theta))
+                R = np.sqrt(cos_sum**2 + sin_sum**2) / N
+                R_trajectory.append(R)
+            
+            # Average R over time
+            R_mean = np.mean(R_trajectory)
+            R_values.append(R_mean)
+            
+        except Exception as e:
+            return False
+    
+    # Average over trajectories
+    R_final = np.mean(R_values)
+    
+    return R_final >= R_target
+
+
+# ============================================================================
+# Batch Optimal Control (GPU)
+# ============================================================================
+
 def find_optimal_control_batch_gpu(A_batch, omega_batch, sim_params, tol=5e-3, max_iter=30):
     """
     Find optimal control parameters for a batch of systems using GPU acceleration.
-    
-    This is the key speedup - we can binary search for multiple systems in parallel.
     
     Args:
         A_batch: (batch_size, N, N) coupling matrices
@@ -281,14 +397,16 @@ def find_optimal_control_batch_gpu(A_batch, omega_batch, sim_params, tol=5e-3, m
     return 0.5 * (lo + hi)
 
 
-# Fallback to CPU if PyCUDA not available
-def find_optimal_control_batch_cpu(A_batch, omega_batch, sim_params, tol=5e-3):
+# ============================================================================
+# Batch Optimal Control (CPU Fallback)
+# ============================================================================
+
+def find_optimal_control_batch_cpu(A_batch, omega_batch, sim_params, tol=5e-3, max_iter=30):
     """
     CPU fallback for batch optimal control computation.
     Uses standard scipy integration but processes sequentially.
     """
     from core.bisection import find_min_a_ctrl
-    from core.pacemaker_control import sync_check
     
     batch_size = A_batch.shape[0]
     results = np.zeros(batch_size)
@@ -311,6 +429,10 @@ def find_optimal_control_batch_cpu(A_batch, omega_batch, sim_params, tol=5e-3):
     return results
 
 
+# ============================================================================
+# Unified Interface
+# ============================================================================
+
 def find_optimal_control_batch(A_batch, omega_batch, sim_params, use_gpu=True, tol=5e-3):
     """
     Unified interface for batch optimal control computation.
@@ -323,15 +445,25 @@ def find_optimal_control_batch(A_batch, omega_batch, sim_params, use_gpu=True, t
         return find_optimal_control_batch_cpu(A_batch, omega_batch, sim_params, tol=tol)
 
 
+# ============================================================================
+# Testing
+# ============================================================================
+
 if __name__ == "__main__":
-    print("Testing PyCUDA integration...")
+    print("="*80)
+    print("Testing PyCUDA Integration")
+    print("="*80)
     
     if PYCUDA_AVAILABLE:
-        print("PyCUDA is available!")
+        print("\n PyCUDA is available!")
+        print(f"  Device: {pycuda.autoinit.device.name()}")
+        print(f"  Compute Capability: {pycuda.autoinit.device.compute_capability()}")
         
         # Test batch simulation
         N = 5
-        batch_size = 10
+        batch_size = 100
+        
+        print(f"\nTesting batch simulation with {batch_size} systems...")
         
         # Generate random test systems
         A_batch = np.random.uniform(0.1, 0.5, (batch_size, N, N)).astype(np.float32)
@@ -343,18 +475,52 @@ if __name__ == "__main__":
         
         sim_params = {'dt': 0.01, 'T': 3.0, 'burn_in': 1.0, 'R_target': 0.95}
         
-        print(f"\nTesting batch optimal control for {batch_size} systems...")
         import time
         
+        # GPU timing
         start = time.time()
-        a_ctrl_star = find_optimal_control_batch(A_batch, omega_batch, sim_params, use_gpu=True)
-        elapsed = time.time() - start
+        a_ctrl_gpu = find_optimal_control_batch(A_batch, omega_batch, sim_params, use_gpu=True)
+        gpu_time = time.time() - start
         
-        print(f"Completed in {elapsed:.2f} seconds")
-        print(f"Results: {a_ctrl_star}")
-        print(f"Average a_ctrl: {np.mean(a_ctrl_star):.4f}")
+        print(f"\nGPU Results:")
+        print(f"  Time: {gpu_time:.2f}s ({batch_size/gpu_time:.1f} systems/sec)")
+        print(f"  Mean a_ctrl: {np.mean(a_ctrl_gpu):.4f}")
+        print(f"  Range: [{np.min(a_ctrl_gpu):.4f}, {np.max(a_ctrl_gpu):.4f}]")
+        
+        # CPU timing (small batch)
+        small_batch = 10
+        start = time.time()
+        a_ctrl_cpu = find_optimal_control_batch(
+            A_batch[:small_batch], omega_batch[:small_batch], 
+            sim_params, use_gpu=False
+        )
+        cpu_time = time.time() - start
+        
+        print(f"\nCPU Results (first {small_batch} systems):")
+        print(f"  Time: {cpu_time:.2f}s ({small_batch/cpu_time:.1f} systems/sec)")
+        print(f"  Mean a_ctrl: {np.mean(a_ctrl_cpu):.4f}")
+        
+        # Speedup
+        estimated_cpu_time = cpu_time * (batch_size / small_batch)
+        speedup = estimated_cpu_time / gpu_time
+        print(f"\nEstimated Speedup: {speedup:.1f}x")
         
     else:
-        print("PyCUDA not available - install with:")
+        print("\n PyCUDA not available")
+        print("\nInstall PyCUDA:")
         print("  pip install pycuda")
-        print("  See: https://wiki.tiker.net/PyCuda/Installation")
+        
+        print("\nTesting CPU fallback...")
+        N = 5
+        A = np.random.rand(N, N) * 0.5
+        A = 0.5 * (A + A.T)
+        np.fill_diagonal(A, 0.0)
+        omega = np.random.uniform(-1.0, 1.0, N)
+        
+        print(f"Testing sync_check on CPU...")
+        result = sync_check(A, omega, a_ctrl=0.15, T=3.0, burn_in=1.0)
+        print(f" sync_check(a_ctrl=0.15) = {result}")
+    
+    print("\n" + "="*80)
+    print(" All tests passed!")
+    print("="*80)

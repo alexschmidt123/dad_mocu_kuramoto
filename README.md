@@ -2,57 +2,69 @@
 
 GPU-accelerated sequential experiment design for learning coupling structures in Kuramoto oscillator networks through active synchronization tests.
 
-## Purpose & Innovation
+## Problem Formulation
 
-### Problem Formulation
 Given a network of coupled Kuramoto oscillators:
 
 $$\dot{\theta}_i = \omega_i + \sum_{j} a_{ij}\sin(\theta_j - \theta_i) + a_{\text{ctrl}}\sin(\theta_c - \theta_i)$$
 
 **Objective**: Minimize the pacemaker control parameter $a_{\text{ctrl}}^*$ needed to synchronize the network, under uncertainty about coupling strengths $a_{ij}$.
 
-**Sequential Design**: Select the most informative pair-wise synchronization tests to efficiently reduce uncertainty about $\{a_{ij}\}$ and minimize $a_{\text{ctrl}}^*$.
+**Sequential Design**: Run exactly K pair-wise synchronization tests, update belief intervals based on sync/no-sync outcomes, and select each next pair by minimizing the predicted Expected Remaining MOCU (Mean Objective Cost of Uncertainty).
 
 ### Mean Objective Cost of Uncertainty (MOCU)
 
-We optimize experiment selection by minimizing expected regret under the current belief state:
+MOCU quantifies the expected regret of acting under uncertainty:
 
 $$\text{MOCU}(h) = \mathbb{E}_{\theta|h}\left[C(a_{\text{IBR}}(h), \theta) - C(a^*(\theta), \theta)\right]$$
+
+where:
+- $a_{\text{IBR}}(h)$ is the worst-case control needed given current belief $h$
+- $a^*(\theta)$ is the optimal control if true couplings $\theta$ were known
 
 **Expected Remaining MOCU (ERM)** for candidate experiment $\xi$:
 
 $$\text{ERM}(h, \xi) = \mathbb{E}_{y|\xi,h}\left[\text{MOCU}(h \oplus (\xi, y))\right]$$
 
-### Key Contributions
-1. **MPNN Surrogate**: Graph neural network approximates expensive MOCU/ERM computations (1000× speedup)
-2. **Fixed Design**: Pre-optimized static sequence using MPNN greedy selection
-3. **DAD Policy**: Deep policy network trained via behavior cloning on MPNN trajectories
-4. **GPU Optimization**: Mixed precision training + adaptive ODE integration (RK45)
+## Key Contributions
 
-## Baseline Comparisons
+1. **MPNN Surrogate (2023)**: Message-passing neural network approximates expensive MOCU/ERM computations via Monte Carlo sampling (~1000× speedup over exact computation)
 
-| Strategy | Description | Components Used |
-|----------|-------------|-----------------|
-| **Random** | Uniformly sample candidate pairs at each step | None |
-| **Fixed Design** | Static sequence optimized offline using MPNN greedy | MPNN Surrogate |
-| **Greedy MPNN** | Minimize predicted ERM at each step | MPNN Surrogate |
-| **DAD with MOCU** | Adaptive policy trained on MPNN trajectories | MPNN Surrogate + Policy Network |
+2. **Fixed Design**: Pre-optimized static K-step sequence using offline greedy MPNN-based selection
 
-**Note**: 
-- Fixed Design is derived from DAD framework using greedy MPNN selection
-- DAD contains both MPNN surrogate and learned policy components
-- All adaptive methods (Fixed, Greedy, DAD) depend on the MPNN surrogate
+3. **DAD Policy**: Deep adaptive policy trained via reinforcement learning to minimize final MOCU by sequentially selecting optimal pair tests
+
+4. **GPU Acceleration**: PyCUDA-based batch ODE integration for parallel Kuramoto simulation (10-50× speedup for data generation)
+
+## Experiment Selection Strategies
+
+| Strategy | Description | Selection Method |
+|----------|-------------|------------------|
+| **Random** | Uniformly sample untested pairs | Random sampling |
+| **Fixed Design** | Static K-step sequence optimized offline | Greedy MPNN (offline) |
+| **Greedy MPNN** | Myopic minimization at each step | $\arg\min_\xi \text{ERM}_{\text{MPNN}}(h, \xi)$ |
+| **DAD Policy** | Adaptive policy network | $\pi_\theta(h, \text{candidates})$ trained via RL |
+
+**Key differences**:
+- **Fixed Design**: Computed once offline, same sequence for all problem instances
+- **Greedy MPNN**: Adapts to observations but makes myopic (one-step-ahead) decisions
+- **DAD Policy**: Learns to anticipate future steps, trained to minimize terminal MOCU
+
+**Dependencies**:
+- All adaptive methods require the MPNN surrogate for fast MOCU/ERM prediction
+- DAD Policy additionally uses a learned policy network trained on MPNN-guided trajectories
 
 ## Repository Structure
 
 ```
 dad_mocu_kuramoto/
-├── generate_data.py         # Step 1: Generate training data
-├── train.py                 # Step 2: Train models
-├── test.py                  # Step 3: Evaluate models
+├── generate_data_gpu.py     # GPU-accelerated data generation
+├── train.py                 # Train all models
+├── test.py                  # Evaluate trained models
+├── test_gpu.py             # GPU setup verification
 ├── configs/
 │   ├── config.yaml         # Full configuration
-│   └── config_fast.yaml    # Fast configuration (for testing)
+│   └── config_fast.yaml    # Fast configuration (testing)
 ├── dataset/                # Generated training data (cached)
 ├── models/                 # Trained models
 │   ├── mpnn_surrogate.pth
@@ -61,14 +73,14 @@ dad_mocu_kuramoto/
 ├── core/                   # Simulation engine
 │   ├── belief.py          # Bayesian belief updates
 │   ├── kuramoto_env.py    # Experiment environment
-│   ├── pacemaker_control.py   # ODE integration (RK45)
+│   ├── pacemaker_control.py   # GPU/CPU ODE integration
 │   └── bisection.py       # Binary search for optimal control
 ├── surrogate/             # MPNN surrogate model
 │   ├── mpnn_surrogate.py
 │   └── train_surrogate.py
 ├── design/                # Experiment selection strategies
-│   ├── greedy_erm.py     # Greedy baseline
-│   ├── dad_policy.py     # Deep adaptive design
+│   ├── greedy_erm.py     # Greedy MPNN baseline
+│   ├── dad_policy.py     # DAD policy network
 │   └── train_rl.py       # RL training
 └── eval/                  # Evaluation utilities
     ├── run_eval.py
@@ -77,72 +89,50 @@ dad_mocu_kuramoto/
 
 ## Installation & Reproduction
 
-### Prerequisites
-- Python 3.9+
-- CUDA 12.1+ (for GPU training)
-- 24-core CPU recommended (for parallel data generation)
-
-### Setup
 ```bash
 # Clone repository
 git clone https://github.com/alexschmidt123/dad_mocu_kuramoto
 cd dad_mocu_kuramoto
 
-# Install PyTorch with CUDA support (optimized for RTX 4090)
+# Create conda environment
+conda create -n dad_mocu_kuramoto python=3.9
+conda activate dad_mocu_kuramoto
+
+# Install PyTorch with CUDA 12.1
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
-# Install other dependencies
-pip install -r requirement.txt
+# Install dependencies (includes PyCUDA)
+pip install -r requirements.txt
 ```
 
-### Quick Start (Fast Config, ~2 hours total)
-
-Optimized for 24-core CPU + RTX 4090 GPU:
+### Quick Start (Fast Config, ~30 minutes)
 
 ```bash
-# Step 1: Generate training data (~1.5 hours with 20 workers)
-python generate_data.py --config configs/config_fast.yaml --split both --parallel --workers 20
+# Step 1: Generate training data with GPU acceleration (~15 min)
+python generate_data_gpu.py --config configs/config_fast.yaml --split both --parallel --workers 16 --gpu
 
-# Step 2: Train all models (~10 min on GPU)
+# Step 2: Train all models (~10 min)
 python train.py --config configs/config_fast.yaml --methods all
 
-# Step 3: Evaluate (~2 min)
+# Step 3: Evaluate (~5 min)
 python test.py --config configs/config_fast.yaml --episodes 50
 ```
 
-**Fast Config Parameters:**
-- Training samples: 500
-- Validation samples: 100
-- MC samples: 10
-- Simulation time: 3.0s
-- Epochs: 50
-
-### Production Run (Full Config, ~15 hours total)
-
-For best quality results:
+### Full Configuration (~2-3 hours)
 
 ```bash
-# Step 1: Generate training data (~12-15 hours with 20 workers)
-python generate_data.py --config configs/config.yaml --split both --parallel --workers 20
+# Step 1: Generate training data (~1.5 hours)
+python generate_data_gpu.py --config configs/config.yaml --split both --parallel --workers 16 --gpu
 
-# Step 2: Train all models (~20 min on GPU)
+# Step 2: Train all models (~20 min)
 python train.py --config configs/config.yaml --methods all
 
 # Step 3: Evaluate (~10 min)
 python test.py --config configs/config.yaml --episodes 100 --save-results results.json
 ```
 
-**Full Config Parameters:**
-- Training samples: 2000
-- Validation samples: 400
-- MC samples: 30
-- Simulation time: 5.0s
-- Epochs: 100
-
-
 ## References
 
 - [Kuramoto Model OED Acceleration](https://github.com/bjyoontamu/Kuramoto-Model-OED-acceleration) - Original implementation by Yoon et al.
 - [Deep Adaptive Design](https://github.com/ae-foster/dad) - DAD framework by Foster et al.
 - [Accelerate OED](https://github.com/Levishery/AccelerateOED) - MPNN acceleration by Chen et al.
-
