@@ -79,9 +79,15 @@ class MPNNSurrogate(nn.Module):
         g_edge = he.mean(dim=0, keepdim=True) if nE > 0 else torch.zeros((1, self.hidden), device=device)
         
         return torch.cat([g_node, g_edge], dim=-1)  # (1, 2*hidden)
-    
+
+
     def forward_mocu(self, belief_graph: dict) -> torch.Tensor:
-        """Predict MOCU from belief graph."""
+        """
+        Predict MOCU from belief graph with automatic denormalization.
+        
+        The model is trained on normalized labels (mean=0, std=1).
+        This method automatically denormalizes predictions to original scale.
+        """
         device = next(self.parameters()).device
         
         node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float32, device=device)
@@ -91,8 +97,17 @@ class MPNNSurrogate(nn.Module):
         g = self._aggregate(node, edge, idx)
         y = self.head_mocu(g)
         
-        # Use softplus to ensure positive output
-        return F.softplus(y) * self.mocu_scale
+        # Model outputs normalized predictions
+        y_normalized = F.softplus(y) * self.mocu_scale
+        
+        # Denormalize to original scale if normalization params are available
+        if hasattr(self, 'mocu_mean') and hasattr(self, 'mocu_std'):
+            # y_original = y_normalized * std + mean
+            y_denormalized = y_normalized * self.mocu_std + self.mocu_mean
+            return y_denormalized
+        else:
+            # No normalization params - return as is (backward compatibility)
+            return y_normalized
     
     def forward_erm(self, belief_graph: dict, xi: tuple) -> torch.Tensor:
         """Predict ERM for a candidate experiment xi."""

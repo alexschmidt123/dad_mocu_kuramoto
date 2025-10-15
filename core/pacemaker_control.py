@@ -1,369 +1,360 @@
 """
-Improved pacemaker control module with better numerical integration.
-Uses scipy's solve_ivp with RK45 for more accurate ODE integration.
+GPU-accelerated pacemaker control using PyCUDA.
+Following Chen et al. (2023) methodology for massive parallelization.
+
+This allows parallel ODE integration for multiple matrices simultaneously,
+dramatically speeding up MOCU computation during data generation.
 """
 
 import numpy as np
+
+# Try to import PyCUDA
 try:
-    from scipy.integrate import solve_ivp
-    SCIPY_AVAILABLE = True
+    import pycuda.autoinit
+    import pycuda.driver as cuda
+    from pycuda.compiler import SourceModule
+    PYCUDA_AVAILABLE = True
 except ImportError:
-    SCIPY_AVAILABLE = False
-    print("Warning: scipy not available, falling back to Euler integration")
+    PYCUDA_AVAILABLE = False
+    print("Warning: PyCUDA not available. Falling back to CPU computation.")
 
 
-def order_param(theta):
-    """
-    Compute Kuramoto order parameter R(t).
-    R = |mean(exp(i*theta))| measures phase coherence.
-    R = 1: perfect synchronization
-    R = 0: completely incoherent
-    """
-    if len(theta.shape) == 1:
-        # Single time point
-        z = np.exp(1j * theta)
-        return np.abs(np.mean(z))
-    else:
-        # Multiple time points
-        z = np.exp(1j * theta)
-        return np.abs(np.mean(z, axis=-1))
+# CUDA kernel for Kuramoto model integration
+KURAMOTO_KERNEL = """
+__device__ float order_param(float* theta, int N) {
+    float cos_sum = 0.0f;
+    float sin_sum = 0.0f;
+    
+    for (int i = 0; i < N; i++) {
+        cos_sum += cosf(theta[i]);
+        sin_sum += sinf(theta[i]);
+    }
+    
+    cos_sum /= N;
+    sin_sum /= N;
+    
+    return sqrtf(cos_sum * cos_sum + sin_sum * sin_sum);
+}
+
+__global__ void kuramoto_step(
+    float* theta,           // Current phases (batch_size, N)
+    float* theta_new,       // Updated phases (batch_size, N)
+    float* A,              // Coupling matrices (batch_size, N, N)
+    float* omega,          // Natural frequencies (batch_size, N)
+    float* a_ctrl,         // Control parameters (batch_size,)
+    int N,                 // Number of oscillators
+    float dt,              // Time step
+    int batch_size
+) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int batch_idx = idx / N;
+    int osc_idx = idx % N;
+    
+    if (batch_idx >= batch_size) return;
+    
+    int base = batch_idx * N;
+    int A_base = batch_idx * N * N;
+    
+    // Natural frequency term
+    float dtheta = omega[base + osc_idx];
+    
+    // Coupling term
+    float coupling = 0.0f;
+    for (int j = 0; j < N; j++) {
+        float a_ij = A[A_base + osc_idx * N + j];
+        float phase_diff = theta[base + j] - theta[base + osc_idx];
+        coupling += a_ij * sinf(phase_diff);
+    }
+    dtheta += coupling;
+    
+    // Pacemaker control term (pacemaker at theta_c = 0)
+    dtheta += a_ctrl[batch_idx] * sinf(-theta[base + osc_idx]);
+    
+    // Update phase
+    float new_theta = theta[base + osc_idx] + dt * dtheta;
+    
+    // Wrap to [-pi, pi]
+    while (new_theta > 3.14159265f) new_theta -= 2.0f * 3.14159265f;
+    while (new_theta < -3.14159265f) new_theta += 2.0f * 3.14159265f;
+    
+    theta_new[base + osc_idx] = new_theta;
+}
+
+__global__ void compute_order_params(
+    float* theta,           // Phases (batch_size, N)
+    float* R_values,       // Output order parameters (batch_size,)
+    int N,
+    int batch_size
+) {
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (batch_idx >= batch_size) return;
+    
+    int base = batch_idx * N;
+    R_values[batch_idx] = order_param(&theta[base], N);
+}
+"""
 
 
-def euler_integrate(theta0, vecfield, dt, steps):
-    """
-    Simple Euler integration (kept for backward compatibility and when scipy unavailable).
-    """
-    theta = theta0.copy()
-    traj = [theta.copy()]
+class GPUKuramotoSimulator:
+    """GPU-accelerated Kuramoto simulator using PyCUDA."""
     
-    for _ in range(steps):
-        theta = theta + dt * vecfield(theta)
-        theta = (theta + np.pi) % (2 * np.pi) - np.pi
-        traj.append(theta.copy())
-    
-    return np.array(traj)
-
-
-def simulate_with_pacemaker(A, omega, a_ctrl, dt=0.01, T=5.0, burn_in=2.0, 
-                            method='RK45', n_trajectories=3):
-    """
-    Simulate Kuramoto model with pacemaker control.
-    
-    Dynamics:
-        dθ_i/dt = ω_i + Σ_j a_ij sin(θ_j - θ_i) + a_ctrl sin(θ_c - θ_i)
-    
-    where θ_c = 0 (pacemaker at origin).
-    
-    Args:
-        A: (N, N) coupling matrix
-        omega: (N,) natural frequencies
-        a_ctrl: scalar pacemaker coupling strength
-        dt: time step for output (not integration step)
-        T: total simulation time
-        burn_in: time to discard for transient behavior
-        method: integration method ('RK45', 'RK23', 'Euler')
-        n_trajectories: number of trajectories to average over
-    
-    Returns:
-        dict with keys: t, theta, R, R_mean, R_all_trajectories
-    """
-    N = len(omega)
-    
-    def kuramoto_pacemaker(t, theta):
-        """ODE right-hand side."""
-        # Natural frequencies
-        dtheta = omega.copy()
+    def __init__(self, N, dt=0.01, T=5.0, burn_in=2.0, R_target=0.95):
+        if not PYCUDA_AVAILABLE:
+            raise RuntimeError("PyCUDA is required for GPU simulator")
         
-        # Coupling terms
-        for i in range(N):
-            coupling = np.sum(A[i] * np.sin(theta - theta[i]))
-            dtheta[i] += coupling
+        self.N = N
+        self.dt = dt
+        self.T = T
+        self.burn_in = burn_in
+        self.R_target = R_target
         
-        # Pacemaker control (θ_c = 0)
-        pacer = a_ctrl * np.sin(-theta)
-        dtheta += pacer
+        # Compile CUDA kernel
+        self.mod = SourceModule(KURAMOTO_KERNEL)
+        self.kuramoto_step = self.mod.get_function("kuramoto_step")
+        self.compute_order_params = self.mod.get_function("compute_order_params")
         
-        return dtheta
-    
-    # Run multiple trajectories and average
-    all_R = []
-    all_theta = []
-    t = None
-    
-    for traj_idx in range(n_trajectories):
-        # Random initial condition
-        theta0 = np.random.uniform(-np.pi, np.pi, size=N)
+        # CUDA block and grid sizes
+        self.block_size = 256
         
-        if method == 'Euler' or not SCIPY_AVAILABLE:
-            # Fallback to Euler method
-            t_eval = np.arange(0, T + dt, dt)
-            theta_traj = [theta0.copy()]
-            theta = theta0.copy()
+    def simulate_batch(self, A_batch, omega_batch, a_ctrl_batch, n_trajectories=1):
+        """
+        Simulate multiple Kuramoto systems in parallel on GPU.
+        
+        Args:
+            A_batch: (batch_size, N, N) coupling matrices
+            omega_batch: (batch_size, N) natural frequencies
+            a_ctrl_batch: (batch_size,) control parameters
+            n_trajectories: number of trajectories per system (averaged)
+        
+        Returns:
+            R_mean: (batch_size,) mean order parameters after burn-in
+        """
+        batch_size = A_batch.shape[0]
+        
+        # Average over multiple trajectories
+        R_means = []
+        
+        for traj in range(n_trajectories):
+            # Initialize random phases
+            theta = np.random.uniform(-np.pi, np.pi, (batch_size, self.N)).astype(np.float32)
             
-            for _ in range(len(t_eval) - 1):
-                dtheta = kuramoto_pacemaker(0, theta)
-                theta = theta + dt * dtheta
-                theta = (theta + np.pi) % (2 * np.pi) - np.pi
-                theta_traj.append(theta.copy())
+            # Allocate GPU memory
+            theta_gpu = cuda.mem_alloc(theta.nbytes)
+            theta_new_gpu = cuda.mem_alloc(theta.nbytes)
+            A_gpu = cuda.mem_alloc(A_batch.astype(np.float32).nbytes)
+            omega_gpu = cuda.mem_alloc(omega_batch.astype(np.float32).nbytes)
+            a_ctrl_gpu = cuda.mem_alloc(a_ctrl_batch.astype(np.float32).nbytes)
             
-            theta_traj = np.array(theta_traj)
-            t = t_eval
-        else:
-            # Use scipy's solve_ivp with adaptive stepping
-            t_eval = np.arange(0, T + dt, dt)
+            # Copy to GPU
+            cuda.memcpy_htod(theta_gpu, theta)
+            cuda.memcpy_htod(A_gpu, A_batch.astype(np.float32))
+            cuda.memcpy_htod(omega_gpu, omega_batch.astype(np.float32))
+            cuda.memcpy_htod(a_ctrl_gpu, a_ctrl_batch.astype(np.float32))
             
-            try:
-                sol = solve_ivp(
-                    kuramoto_pacemaker,
-                    t_span=(0, T),
-                    y0=theta0,
-                    method=method,
-                    t_eval=t_eval,
-                    rtol=1e-6,
-                    atol=1e-8
+            # Integration parameters
+            n_steps = int(self.T / self.dt)
+            burn_in_steps = int(self.burn_in / self.dt)
+            
+            # Grid size
+            total_threads = batch_size * self.N
+            grid_size = (total_threads + self.block_size - 1) // self.block_size
+            
+            # Integrate
+            R_accumulator = np.zeros(batch_size, dtype=np.float32)
+            n_recorded = 0
+            
+            for step in range(n_steps):
+                # Perform one integration step
+                self.kuramoto_step(
+                    theta_gpu, theta_new_gpu,
+                    A_gpu, omega_gpu, a_ctrl_gpu,
+                    np.int32(self.N),
+                    np.float32(self.dt),
+                    np.int32(batch_size),
+                    block=(self.block_size, 1, 1),
+                    grid=(grid_size, 1)
                 )
                 
-                theta_traj = sol.y.T  # (time_steps, N)
-                t = sol.t
+                # Swap buffers
+                theta_gpu, theta_new_gpu = theta_new_gpu, theta_gpu
                 
-                # Wrap angles to [-π, π]
-                theta_traj = (theta_traj + np.pi) % (2 * np.pi) - np.pi
-            except Exception as e:
-                # Fallback to Euler if scipy fails
-                print(f"Warning: scipy integration failed ({e}), using Euler")
-                t_eval = np.arange(0, T + dt, dt)
-                theta_traj = [theta0.copy()]
-                theta = theta0.copy()
-                
-                for _ in range(len(t_eval) - 1):
-                    dtheta = kuramoto_pacemaker(0, theta)
-                    theta = theta + dt * dtheta
-                    theta = (theta + np.pi) % (2 * np.pi) - np.pi
-                    theta_traj.append(theta.copy())
-                
-                theta_traj = np.array(theta_traj)
-                t = t_eval
+                # Record order parameter after burn-in
+                if step >= burn_in_steps:
+                    R_values = np.zeros(batch_size, dtype=np.float32)
+                    R_values_gpu = cuda.mem_alloc(R_values.nbytes)
+                    
+                    grid_size_R = (batch_size + self.block_size - 1) // self.block_size
+                    self.compute_order_params(
+                        theta_gpu, R_values_gpu,
+                        np.int32(self.N),
+                        np.int32(batch_size),
+                        block=(self.block_size, 1, 1),
+                        grid=(grid_size_R, 1)
+                    )
+                    
+                    cuda.memcpy_dtoh(R_values, R_values_gpu)
+                    R_accumulator += R_values
+                    n_recorded += 1
+            
+            # Average R over time steps
+            R_mean = R_accumulator / n_recorded
+            R_means.append(R_mean)
         
-        # Compute order parameter
-        R = order_param(theta_traj)
-        all_R.append(R)
-        all_theta.append(theta_traj)
+        # Average over trajectories
+        return np.mean(R_means, axis=0)
     
-    # Average over trajectories
-    avg_R = np.mean(all_R, axis=0)
+    def sync_check_batch(self, A_batch, omega_batch, a_ctrl_batch, n_trajectories=1):
+        """
+        Check synchronization for a batch of systems.
+        
+        Returns:
+            sync_flags: (batch_size,) boolean array indicating if each system syncs
+        """
+        R_mean = self.simulate_batch(A_batch, omega_batch, a_ctrl_batch, n_trajectories)
+        return R_mean >= self.R_target
+
+
+def find_optimal_control_batch_gpu(A_batch, omega_batch, sim_params, tol=5e-3, max_iter=30):
+    """
+    Find optimal control parameters for a batch of systems using GPU acceleration.
     
-    # Compute mean R after burn-in
-    mask = t >= burn_in
-    if np.any(mask):
-        R_mean = float(np.mean(avg_R[mask]))
-    else:
-        R_mean = float(np.mean(avg_R))
+    This is the key speedup - we can binary search for multiple systems in parallel.
     
-    return dict(
-        t=t,
-        theta=all_theta[0],  # Return first trajectory for visualization
-        R=avg_R,
-        R_mean=R_mean,
-        R_all_trajectories=all_R
+    Args:
+        A_batch: (batch_size, N, N) coupling matrices
+        omega_batch: (batch_size, N) natural frequencies
+        sim_params: dict with dt, T, burn_in, R_target
+        tol: tolerance for binary search
+        max_iter: maximum iterations
+    
+    Returns:
+        a_ctrl_star: (batch_size,) optimal control parameters
+    """
+    if not PYCUDA_AVAILABLE:
+        raise RuntimeError("PyCUDA required for batch GPU computation")
+    
+    batch_size = A_batch.shape[0]
+    N = A_batch.shape[1]
+    
+    # Initialize simulator
+    simulator = GPUKuramotoSimulator(
+        N=N,
+        dt=sim_params.get('dt', 0.01),
+        T=sim_params.get('T', 5.0),
+        burn_in=sim_params.get('burn_in', 2.0),
+        R_target=sim_params.get('R_target', 0.95)
     )
-
-
-def sync_check(A, omega, a_ctrl, R_target=0.95, dt=0.01, T=5.0, burn_in=2.0, 
-               method='RK45', n_trajectories=3):
-    """
-    Check if system synchronizes with given control parameter.
     
-    Returns True if mean order parameter R after burn-in exceeds R_target.
+    # Initialize search bounds for each system
+    lo = np.zeros(batch_size, dtype=np.float32)
+    hi = np.full(batch_size, 0.1, dtype=np.float32)
     
-    Args:
-        A: (N, N) coupling matrix
-        omega: (N,) natural frequencies  
-        a_ctrl: scalar pacemaker coupling strength
-        R_target: threshold for synchronization (default 0.95)
-        dt: time step for output
-        T: total simulation time
-        burn_in: time to discard for transient behavior
-        method: integration method
-        n_trajectories: number of trajectories to average over
-    
-    Returns:
-        bool: True if synchronized, False otherwise
-    """
-    try:
-        out = simulate_with_pacemaker(
-            A, omega, a_ctrl, 
-            dt=dt, T=T, burn_in=burn_in, 
-            method=method, n_trajectories=n_trajectories
-        )
-        return out["R_mean"] >= R_target
-    except Exception as e:
-        # If integration fails, assume not synchronized
-        print(f"Warning: Integration failed for a_ctrl={a_ctrl}: {e}")
-        return False
-
-
-def compute_phase_coherence(theta_traj, window_size=50):
-    """
-    Compute time-averaged phase coherence over sliding windows.
-    Useful for detecting intermittent synchronization.
-    
-    Args:
-        theta_traj: (T, N) array of phase trajectories
-        window_size: size of sliding window
-    
-    Returns:
-        array of coherence values over time
-    """
-    T = len(theta_traj)
-    coherence = []
-    
-    for t in range(window_size, T):
-        window = theta_traj[t-window_size:t]
-        R_window = order_param(window)
-        coherence.append(np.mean(R_window))
-    
-    return np.array(coherence)
-
-
-def estimate_sync_time(A, omega, a_ctrl, R_target=0.95, dt=0.01, max_time=20.0, 
-                       method='RK45'):
-    """
-    Estimate time required to reach synchronization.
-    
-    Returns:
-        float: time to sync, or np.inf if doesn't sync within max_time
-    """
-    if not SCIPY_AVAILABLE:
-        print("Warning: estimate_sync_time requires scipy, returning inf")
-        return np.inf
-    
-    N = len(omega)
-    theta0 = np.random.uniform(-np.pi, np.pi, size=N)
-    
-    def kuramoto_pacemaker(t, theta):
-        dtheta = omega.copy()
-        for i in range(N):
-            coupling = np.sum(A[i] * np.sin(theta - theta[i]))
-            dtheta[i] += coupling
-        pacer = a_ctrl * np.sin(-theta)
-        dtheta += pacer
-        return dtheta
-    
-    # Event function to detect synchronization
-    def sync_event(t, theta):
-        R = order_param(theta)
-        return R - R_target
-    
-    sync_event.terminal = True
-    sync_event.direction = 1
-    
-    try:
-        sol = solve_ivp(
-            kuramoto_pacemaker,
-            t_span=(0, max_time),
-            y0=theta0,
-            method=method,
-            events=sync_event,
-            rtol=1e-6,
-            atol=1e-8
-        )
+    # Phase 1: Expand upper bounds until all systems sync
+    max_expand = 20
+    for expand_iter in range(max_expand):
+        syncs = simulator.sync_check_batch(A_batch, omega_batch, hi, n_trajectories=2)
         
-        if sol.t_events[0].size > 0:
-            return float(sol.t_events[0][0])
-        else:
-            return np.inf
-    except Exception as e:
-        print(f"Warning: estimate_sync_time failed: {e}")
-        return np.inf
+        if np.all(syncs):
+            break
+        
+        # Double hi for systems that don't sync yet
+        hi[~syncs] *= 2.0
+    
+    # Phase 2: Binary search for each system
+    for iter in range(max_iter):
+        # Check convergence
+        if np.all(hi - lo <= tol):
+            break
+        
+        # Compute midpoints
+        mid = 0.5 * (lo + hi)
+        
+        # Check which systems sync at midpoint
+        syncs = simulator.sync_check_batch(A_batch, omega_batch, mid, n_trajectories=2)
+        
+        # Update bounds
+        hi[syncs] = mid[syncs]
+        lo[~syncs] = mid[~syncs]
+    
+    # Return final estimates
+    return 0.5 * (lo + hi)
 
 
-def analyze_synchronization_quality(A, omega, a_ctrl, dt=0.01, T=10.0, burn_in=5.0,
-                                    method='RK45', n_trajectories=5):
+# Fallback to CPU if PyCUDA not available
+def find_optimal_control_batch_cpu(A_batch, omega_batch, sim_params, tol=5e-3):
     """
-    Comprehensive analysis of synchronization quality.
-    
-    Returns:
-        dict with metrics:
-        - R_mean: mean order parameter after burn-in
-        - R_std: standard deviation of order parameter
-        - R_min: minimum order parameter after burn-in
-        - sync_achieved: whether R_mean >= 0.95
-        - stability: measure of synchronization stability
+    CPU fallback for batch optimal control computation.
+    Uses standard scipy integration but processes sequentially.
     """
-    results = []
+    from core.bisection import find_min_a_ctrl
+    from core.pacemaker_control import sync_check
     
-    for _ in range(n_trajectories):
-        out = simulate_with_pacemaker(
-            A, omega, a_ctrl, dt=dt, T=T, burn_in=burn_in,
-            method=method, n_trajectories=1
-        )
+    batch_size = A_batch.shape[0]
+    results = np.zeros(batch_size)
+    
+    for i in range(batch_size):
+        A = A_batch[i]
+        omega = omega_batch[i]
         
-        t = out['t']
-        R = out['R']
-        mask = t >= burn_in
+        def check_fn(a_ctrl):
+            try:
+                return sync_check(A, omega, a_ctrl, **sim_params)
+            except:
+                return False
         
-        if np.any(mask):
-            R_post_burn = R[mask]
-            results.append({
-                'R_mean': np.mean(R_post_burn),
-                'R_std': np.std(R_post_burn),
-                'R_min': np.min(R_post_burn)
-            })
+        try:
+            results[i] = find_min_a_ctrl(A, omega, check_fn, lo=0.0, hi_init=0.1, tol=tol)
+        except:
+            results[i] = 2.0
     
-    # Aggregate results
-    R_means = [r['R_mean'] for r in results]
-    R_stds = [r['R_std'] for r in results]
-    R_mins = [r['R_min'] for r in results]
+    return results
+
+
+def find_optimal_control_batch(A_batch, omega_batch, sim_params, use_gpu=True, tol=5e-3):
+    """
+    Unified interface for batch optimal control computation.
     
-    avg_R_mean = np.mean(R_means)
-    avg_R_std = np.mean(R_stds)
-    avg_R_min = np.mean(R_mins)
-    
-    # Stability: low if high variance across trajectories
-    stability = 1.0 / (1.0 + np.std(R_means))
-    
-    return {
-        'R_mean': avg_R_mean,
-        'R_std': avg_R_std,
-        'R_min': avg_R_min,
-        'sync_achieved': avg_R_mean >= 0.95,
-        'stability': stability,
-        'trajectory_variance': np.std(R_means)
-    }
+    Automatically uses GPU if available, otherwise falls back to CPU.
+    """
+    if use_gpu and PYCUDA_AVAILABLE:
+        return find_optimal_control_batch_gpu(A_batch, omega_batch, sim_params, tol=tol)
+    else:
+        return find_optimal_control_batch_cpu(A_batch, omega_batch, sim_params, tol=tol)
 
 
 if __name__ == "__main__":
-    print("Testing improved pacemaker control...")
+    print("Testing PyCUDA integration...")
     
-    # Create test system
-    N = 5
-    omega = np.random.uniform(-1.0, 1.0, N)
-    A = np.random.uniform(0.1, 0.5, (N, N))
-    A = 0.5 * (A + A.T)
-    np.fill_diagonal(A, 0.0)
-    
-    # Test synchronization check
-    print("\nTesting sync_check with different a_ctrl values:")
-    for a_ctrl in [0.0, 0.1, 0.2, 0.3, 0.5]:
-        method = 'RK45' if SCIPY_AVAILABLE else 'Euler'
-        synced = sync_check(A, omega, a_ctrl, method=method, n_trajectories=2)
-        print(f"  a_ctrl = {a_ctrl:.2f}: {'✓ Synchronized' if synced else '✗ Not synchronized'}")
-    
-    # Test simulation
-    print("\nTesting simulation with a_ctrl = 0.3:")
-    method = 'RK45' if SCIPY_AVAILABLE else 'Euler'
-    result = simulate_with_pacemaker(A, omega, 0.3, T=5.0, method=method, n_trajectories=2)
-    print(f"  Mean R after burn-in: {result['R_mean']:.4f}")
-    print(f"  Final R: {result['R'][-1]:.4f}")
-    
-    # Test comprehensive analysis
-    if SCIPY_AVAILABLE:
-        print("\nTesting comprehensive synchronization analysis:")
-        analysis = analyze_synchronization_quality(A, omega, 0.3, T=10.0, n_trajectories=3)
-        print(f"  R_mean: {analysis['R_mean']:.4f}")
-        print(f"  R_std: {analysis['R_std']:.4f}")
-        print(f"  R_min: {analysis['R_min']:.4f}")
-        print(f"  Stability: {analysis['stability']:.4f}")
-        print(f"  Sync achieved: {analysis['sync_achieved']}")
-    
-    print("\n✓ All tests passed!")
+    if PYCUDA_AVAILABLE:
+        print("PyCUDA is available!")
+        
+        # Test batch simulation
+        N = 5
+        batch_size = 10
+        
+        # Generate random test systems
+        A_batch = np.random.uniform(0.1, 0.5, (batch_size, N, N)).astype(np.float32)
+        for i in range(batch_size):
+            A_batch[i] = 0.5 * (A_batch[i] + A_batch[i].T)
+            np.fill_diagonal(A_batch[i], 0.0)
+        
+        omega_batch = np.random.uniform(-1.0, 1.0, (batch_size, N)).astype(np.float32)
+        
+        sim_params = {'dt': 0.01, 'T': 3.0, 'burn_in': 1.0, 'R_target': 0.95}
+        
+        print(f"\nTesting batch optimal control for {batch_size} systems...")
+        import time
+        
+        start = time.time()
+        a_ctrl_star = find_optimal_control_batch(A_batch, omega_batch, sim_params, use_gpu=True)
+        elapsed = time.time() - start
+        
+        print(f"Completed in {elapsed:.2f} seconds")
+        print(f"Results: {a_ctrl_star}")
+        print(f"Average a_ctrl: {np.mean(a_ctrl_star):.4f}")
+        
+    else:
+        print("PyCUDA not available - install with:")
+        print("  pip install pycuda")
+        print("  See: https://wiki.tiker.net/PyCuda/Installation")

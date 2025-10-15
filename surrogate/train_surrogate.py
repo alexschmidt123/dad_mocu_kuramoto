@@ -1,6 +1,6 @@
 """
 Fixed training pipeline for the MPNN surrogate model.
-Uses cached data for faster iteration.
+Uses cached data with proper normalization.
 """
 
 import torch
@@ -11,7 +11,6 @@ import pickle
 import os
 from typing import List, Dict, Tuple
 from surrogate.mpnn_surrogate import MPNNSurrogate
-from data_generation.synthetic_data import SyntheticDataGenerator
 
 # Try to import tqdm
 try:
@@ -24,7 +23,7 @@ except ImportError:
 class DataCache:
     """Load cached datasets."""
     
-    def __init__(self, cache_dir: str = "dataset"):  # Changed from "data"
+    def __init__(self, cache_dir: str = "dataset"):
         self.cache_dir = cache_dir
     
     def get_cache_path(self, split: str, N: int, K: int, n_samples: int, 
@@ -53,6 +52,59 @@ class DataCache:
             dataset = pickle.load(f)
         print(f" Loaded {len(dataset)} samples from cache: {path}")
         return dataset
+
+
+def normalize_dataset(dataset, stats=None):
+    """
+    Normalize MOCU labels to mean=0, std=1.
+    
+    Following Chen et al. (2023) methodology for better training convergence.
+    
+    Args:
+        dataset: List of training samples
+        stats: Optional tuple (mean, std) to use. If None, compute from dataset.
+    
+    Returns:
+        normalized_dataset, (mean, std)
+    """
+    # Collect all MOCU values
+    all_mocu = []
+    for sample in dataset:
+        for step_data in sample['experiment_data']:
+            all_mocu.append(step_data['mocu'])
+        all_mocu.append(sample['final_mocu'])
+    
+    # Compute or use provided statistics
+    if stats is None:
+        mean = float(np.mean(all_mocu))
+        std = float(np.std(all_mocu))
+        if std < 1e-6:  # Avoid division by zero
+            std = 1.0
+            print("  �  WARNING: MOCU has near-zero variance!")
+    else:
+        mean, std = stats
+    
+    print(f"  Normalizing MOCU: mean={mean:.4f}, std={std:.4f}")
+    print(f"  Original range: [{np.min(all_mocu):.4f}, {np.max(all_mocu):.4f}]")
+    
+    # Normalize all MOCU labels
+    for sample in dataset:
+        for step_data in sample['experiment_data']:
+            step_data['mocu'] = (step_data['mocu'] - mean) / std
+        sample['final_mocu'] = (sample['final_mocu'] - mean) / std
+    
+    # Verify normalization
+    all_normalized = []
+    for sample in dataset:
+        for step_data in sample['experiment_data']:
+            all_normalized.append(step_data['mocu'])
+        all_normalized.append(sample['final_mocu'])
+    
+    print(f"  Normalized range: [{np.min(all_normalized):.4f}, {np.max(all_normalized):.4f}]")
+    print(f"  Normalized mean: {np.mean(all_normalized):.4f} (should be ~0)")
+    print(f"  Normalized std: {np.std(all_normalized):.4f} (should be ~1)")
+    
+    return dataset, (mean, std)
 
 
 class SurrogateTrainer:
@@ -129,13 +181,7 @@ class SurrogateTrainer:
                 labels = []
                 
                 for belief_graph, mocu_label in batch_samples:
-                    # Move belief graph to device
-                    belief_graph_gpu = {
-                        'node_feats': belief_graph['node_feats'],
-                        'edge_feats': belief_graph['edge_feats'],
-                        'edge_index': belief_graph['edge_index']
-                    }
-                    pred = self.model.forward_mocu(belief_graph_gpu)
+                    pred = self.model.forward_mocu(belief_graph)
                     predictions.append(pred)
                     labels.append(mocu_label)
                 
@@ -385,13 +431,14 @@ class SurrogateTrainer:
             'sync': sync_results
         }
 
+
 def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: int = 200,
                          n_theta_samples: int = 20, epochs: int = 50, lr: float = 1e-3, 
                          batch_size: int = 32, device: str = None, 
                          save_path: str = 'trained_surrogate.pth',
                          use_cache: bool = True, hidden: int = 64, dropout: float = 0.1,
                          mocu_scale: float = 1.0):
-    """Complete training pipeline - uses cached data if available."""
+    """Complete training pipeline with normalization - uses cached data if available."""
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
         print(f"Auto-detected device: {device}")
@@ -409,7 +456,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     print()
     
     # Load data
-    cache = DataCache()  # Now uses "dataset" folder
+    cache = DataCache()
     
     if use_cache:
         # Try to load from cache
@@ -422,30 +469,34 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
             val_data = cache.load("val", N, K, n_val, n_theta_samples, 123)
             print()
         except FileNotFoundError as e:
-            print(f"\n Error: {e}")
+            print(f"\nL Error: {e}")
             print("\nPlease generate data first:")
             print("  python generate_data.py --split both --parallel")
             raise
     else:
-        # Generate data on-the-fly (fallback)
-        print(" Generating data on-the-fly (not using cache)...")
-        print("This will be slow. Consider using generate_data.py instead.\n")
-        
-        from data_generation.synthetic_data import SyntheticDataGenerator
-        
-        print("Generating training data...")
-        train_generator = SyntheticDataGenerator(
-            N=N, K=K, n_samples=n_train, n_theta_samples=n_theta_samples
-        )
-        train_data = train_generator.generate_dataset(seed=42)
-        print()
-        
-        print("Generating validation data...")
-        val_generator = SyntheticDataGenerator(
-            N=N, K=K, n_samples=n_val, n_theta_samples=n_theta_samples
-        )
-        val_data = val_generator.generate_dataset(seed=123)
-        print()
+        raise NotImplementedError("On-the-fly data generation not implemented")
+    
+    # ============================================================
+    # CRITICAL FIX: Add data normalization here
+    # ============================================================
+    print("\n" + "="*80)
+    print("NORMALIZING MOCU LABELS (Chen et al. 2023)")
+    print("="*80)
+    
+    # Normalize training data and get statistics
+    print("Normalizing training data...")
+    train_data, (mocu_mean, mocu_std) = normalize_dataset(train_data, stats=None)
+    
+    # Normalize validation data using training statistics
+    print("\nNormalizing validation data (using training stats)...")
+    val_data, _ = normalize_dataset(val_data, stats=(mocu_mean, mocu_std))
+    
+    # Save normalization parameters alongside the model
+    norm_path = os.path.join(os.path.dirname(save_path), 'mocu_normalization.pkl')
+    with open(norm_path, 'wb') as f:
+        pickle.dump({'mean': mocu_mean, 'std': mocu_std}, f)
+    print(f"\n Saved normalization parameters to {norm_path}")
+    print("="*80 + "\n")
     
     # Initialize model
     print("Initializing model...")
@@ -454,6 +505,11 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
         hidden=hidden,
         dropout=dropout
     )
+    
+    # Store normalization in model for inference
+    model.mocu_mean = mocu_mean
+    model.mocu_std = mocu_std
+    
     trainer = SurrogateTrainer(model, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
     print()
@@ -465,10 +521,43 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     if save_path:
         print(f"Saving model to {save_path}...")
         torch.save(model.state_dict(), save_path)
-        print(" Model saved successfully!")
+        print(" Model saved successfully!")
         print()
     
     return model, results
+
+
+def load_surrogate_with_normalization(model_path, hidden=64, dropout=0.1, mocu_scale=1.0, device='cpu'):
+    """
+    Load surrogate model and its normalization parameters.
+    
+    The model will automatically denormalize predictions during inference.
+    """
+    # Load model
+    model = MPNNSurrogate(
+        mocu_scale=mocu_scale,
+        hidden=hidden,
+        dropout=dropout
+    )
+    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+    
+    # Load normalization parameters
+    norm_path = os.path.join(os.path.dirname(model_path), 'mocu_normalization.pkl')
+    if os.path.exists(norm_path):
+        with open(norm_path, 'rb') as f:
+            norm_params = pickle.load(f)
+        model.mocu_mean = norm_params['mean']
+        model.mocu_std = norm_params['std']
+        print(f" Loaded normalization: mean={model.mocu_mean:.4f}, std={model.mocu_std:.4f}")
+    else:
+        print("�  Warning: No normalization file found. Model may not predict correctly.")
+        model.mocu_mean = 0.0
+        model.mocu_std = 1.0
+    
+    model.to(device)
+    model.eval()
+    
+    return model
 
 
 if __name__ == "__main__":
@@ -478,7 +567,7 @@ if __name__ == "__main__":
         epochs=20, device=None, save_path='test_surrogate.pth',
         use_cache=True
     )
-    print("\n Training completed successfully!")
+    print("\n Training completed successfully!")
     print(f"Final MOCU train loss: {results['mocu']['train_losses'][-1]:.4f}")
     print(f"Final ERM train loss: {results['erm']['train_losses'][-1]:.4f}")
     print(f"Final Sync train loss: {results['sync']['train_losses'][-1]:.4f}")
