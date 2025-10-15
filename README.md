@@ -69,7 +69,7 @@ dad_mocu_kuramoto/
 ├── design/                # Experiment selection strategies
 │   ├── greedy_erm.py     # Greedy baseline
 │   ├── dad_policy.py     # Deep adaptive design
-│   └── train_rl.py       # rl training
+│   └── train_rl.py       # RL training
 └── eval/                  # Evaluation utilities
     ├── run_eval.py
     └── metrics.py
@@ -85,14 +85,14 @@ dad_mocu_kuramoto/
 ### Setup
 ```bash
 # Clone repository
-git clone [<repo-url>](https://github.com/alexschmidt123/dad_mocu_kuramoto)
+git clone https://github.com/alexschmidt123/dad_mocu_kuramoto
 cd dad_mocu_kuramoto
 
 # Install PyTorch with CUDA support (optimized for RTX 4090)
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 # Install other dependencies
-pip install numpy scipy pyyaml matplotlib tqdm
+pip install -r requirement.txt
 ```
 
 ### Quick Start (Fast Config, ~2 hours total)
