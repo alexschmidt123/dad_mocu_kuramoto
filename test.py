@@ -15,7 +15,7 @@ from core.kuramoto_env import PairTestEnv
 from surrogate.mpnn_surrogate import MPNNSurrogate
 from design.greedy_erm import choose_next_pair_greedy
 from design.dad_policy import DADPolicy
-from design.train_bc import make_hist_tokens
+from design.train_rl import make_hist_tokens
 from eval.run_eval import run_episode
 from eval.metrics import (print_comparison_results, plot_mocu_curves, 
                          plot_a_ctrl_distribution, save_results, 

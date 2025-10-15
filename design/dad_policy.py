@@ -14,14 +14,17 @@ class SimpleEncoder(nn.Module):
         node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float, device=device)
         edge = torch.as_tensor(belief_graph["edge_feats"], dtype=torch.float, device=device)
         
-        hn = self.node(node).mean(0, keepdim=True)  # (1, hidden)
+        nN = node.shape[0]
+        nE = edge.shape[0]
         
-        if edge.numel() > 0:
-            he = self.edge(edge).mean(0, keepdim=True)  # (1, hidden)
+        hn = self.node(node).mean(0, keepdim=True)
+        
+        if nE > 0:
+            he = self.edge(edge).mean(0, keepdim=True)
         else:
             he = torch.zeros((1, self.hidden), device=device)
         
-        return torch.cat([hn, he], dim=-1)  # (1, 2*hidden)
+        return torch.cat([hn, he], dim=-1)
 
 
 class LSTMHistory(nn.Module):
@@ -38,15 +41,13 @@ class LSTMHistory(nn.Module):
         
         x = torch.as_tensor(hist_tokens, dtype=torch.float, device=device)
         
-        # Ensure x is 3D: (batch=1, seq_len, in_dim=3)
         if x.dim() == 2:
-            x = x.unsqueeze(0)  # (seq_len, 3) -> (1, seq_len, 3)
+            x = x.unsqueeze(0)
         
         out, (h, c) = self.lstm(x)
-        # h has shape: (num_layers=1, batch=1, hidden)
-        # We want: (batch=1, hidden) for concatenation
-        # So remove the num_layers dimension
-        return h.squeeze(0)  # (1, 1, hidden) -> (1, hidden)
+        h = h.squeeze(0)
+        
+        return h
 
 
 class DADPolicy(nn.Module):
@@ -57,71 +58,58 @@ class DADPolicy(nn.Module):
         self.encoder = SimpleEncoder(hidden=hidden)
         self.hist = LSTMHistory(in_dim=3, hidden=hidden)
         
-        # Fusion layer: 2*hidden (encoder) + hidden (history) + 2 (candidate) = 3*hidden + 2
-        fusion_input_dim = 3 * hidden + 2
+        # Fusion: graph (2*hidden) + history (hidden) + candidate (6)
+        fusion_input_dim = 3 * hidden + 6
+        
         self.fuse = nn.Sequential(
             nn.Linear(fusion_input_dim, hidden),
+            nn.LayerNorm(hidden),
             nn.ReLU(),
-            nn.Linear(hidden, 1)
+            nn.Dropout(0.1),
+            nn.Linear(hidden, hidden // 2),
+            nn.LayerNorm(hidden // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden // 2, 1)
         )
 
     def forward(self, belief_graph, cand_pairs, hist_tokens, N):
-        z_graph = self.encoder(belief_graph)  # (1, 2*hidden)
-        z_hist = self.hist(hist_tokens)        # (1, hidden)
+        z_graph = self.encoder(belief_graph)
+        z_hist = self.hist(hist_tokens)
         
         scores = []
         device = next(self.parameters()).device
         
+        # Get node features for candidate encoding
+        node_feats = torch.as_tensor(
+            belief_graph["node_feats"], 
+            dtype=torch.float, 
+            device=device
+        )
+        
         for (i, j) in cand_pairs:
-            cand = torch.tensor([[i / (N - 1 + 1e-9), j / (N - 1 + 1e-9)]], 
-                               dtype=torch.float, device=device)  # (1, 2)
+            node_i = node_feats[i]
+            node_j = node_feats[j]
             
-            # All tensors now have shape (1, D), can concatenate along dim=-1
-            z = torch.cat([z_graph, z_hist, cand], dim=-1)  # (1, 3*hidden + 2)
-            score = self.fuse(z).squeeze(1)  # (1,)
+            cand = torch.cat([
+                node_i,
+                node_j,
+                torch.tensor([i / (N - 1 + 1e-9), j / (N - 1 + 1e-9)], 
+                           dtype=torch.float, device=device)
+            ]).unsqueeze(0)
+            
+            z = torch.cat([z_graph, z_hist, cand], dim=-1)
+            score = self.fuse(z).squeeze(1)
             scores.append(score)
         
-        return torch.cat(scores, dim=0)  # (num_candidates,)
+        scores = torch.cat(scores, dim=0)
+        
+        # NO score normalization - keep raw scores for RL training
+        
+        return scores
 
     def choose(self, env, hist_tokens):
         cands = env.candidate_pairs()
         g = env.features()
         scores = self.forward(g, cands, hist_tokens, env.N).detach().cpu().numpy()
         return cands[int(scores.argmin())]
-
-
-if __name__ == "__main__":
-    print("Testing DAD Policy dimensions...")
-    
-    # Create dummy inputs
-    N = 5
-    belief_graph = {
-        'node_feats': torch.randn(N, 2).numpy(),
-        'edge_feats': torch.randn(10, 5).numpy(),
-        'edge_index': torch.randint(0, N, (2, 10)).numpy()
-    }
-    
-    cand_pairs = [(i, j) for i in range(N) for j in range(i+1, N)]
-    
-    # Test with different history lengths
-    test_histories = [
-        [],  # Empty history
-        [[0.2, 0.4, 1.0]],  # One experiment
-        [[0.2, 0.4, 1.0], [0.1, 0.3, 0.0]],  # Two experiments
-        [[0.2, 0.4, 1.0], [0.1, 0.3, 0.0], [0.3, 0.5, 1.0]],  # Three
-    ]
-    
-    policy = DADPolicy(hidden=64)
-    
-    for i, hist_tokens in enumerate(test_histories):
-        print(f"\nTest {i+1}: {len(hist_tokens)} experiments in history")
-        try:
-            scores = policy.forward(belief_graph, cand_pairs, hist_tokens, N)
-            print(f"  SUCCESS: scores shape = {scores.shape}")
-            print(f"  Sample scores: {scores[:3].detach().numpy()}")
-        except Exception as e:
-            print(f"  FAILED: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    print("\nAll tests completed!")

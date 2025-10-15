@@ -31,12 +31,12 @@ surrogate:
   epochs: 50          # Reduced from 100
   lr: 0.001
   batch_size: 512
-
-dad_bc:
+  
+dad_rl:
   hidden: 128
-  epochs: 3           # Reduced from 5
-  episodes_per_epoch: 20  # Reduced from 30
-  lr: 0.001
+  epochs: 20           # Increased for RL
+  episodes_per_epoch: 30
+  lr: 0.0003          # Lower LR for stable RL
 
 enable_dad: true
 

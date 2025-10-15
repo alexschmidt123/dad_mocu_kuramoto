@@ -69,7 +69,7 @@ dad_mocu_kuramoto/
 ├── design/                # Experiment selection strategies
 │   ├── greedy_erm.py     # Greedy baseline
 │   ├── dad_policy.py     # Deep adaptive design
-│   └── train_bc.py       # Behavior cloning
+│   └── train_rl.py       # rl training
 └── eval/                  # Evaluation utilities
     ├── run_eval.py
     └── metrics.py

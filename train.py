@@ -15,7 +15,7 @@ from surrogate.mpnn_surrogate import MPNNSurrogate
 from surrogate.train_surrogate import train_surrogate_model
 from design.greedy_erm import choose_next_pair_greedy
 from design.dad_policy import DADPolicy
-from design.train_bc import train_behavior_cloning
+from design.train_rl import train_behavior_cloning
 
 
 def setup_gpu():
@@ -165,10 +165,9 @@ def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
     
     return fixed_sequence
 
-
 def train_dad_policy(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
                      force: bool = False) -> DADPolicy:
-    """Train DAD policy via behavior cloning."""
+    """Train DAD policy via reinforcement learning to minimize MOCU."""
     model_path = os.path.join(models_dir, "dad_policy.pth")
     
     print("\n" + "="*80)
@@ -183,13 +182,17 @@ def train_dad_policy(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
         print("Policy loaded\n")
         return policy
     
-    print("Training DAD policy via behavior cloning on Greedy MPNN trajectories...")
+    print("Training DAD policy via RL to minimize MOCU...")
     env_factory = make_env_factory(cfg, surrogate=surrogate)
     policy = DADPolicy(hidden=cfg["dad_bc"]["hidden"])
     
-    policy = train_behavior_cloning(
+    # Changed: Import from train_rl instead of train_bc
+    from design.train_rl import train_dad_rl
+    
+    policy = train_dad_rl(
         env_factory=env_factory,
         policy=policy,
+        surrogate=surrogate,
         epochs=cfg["dad_bc"]["epochs"],
         episodes_per_epoch=cfg["dad_bc"]["episodes_per_epoch"],
         lr=cfg["dad_bc"]["lr"]
@@ -200,7 +203,6 @@ def train_dad_policy(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
     print(f"DAD policy saved to {model_path}\n")
     
     return policy
-
 
 def main():
     parser = argparse.ArgumentParser(

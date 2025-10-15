@@ -119,21 +119,3 @@ def train_dad_rl(env_factory, policy: DADPolicy, surrogate, epochs=10, episodes_
     print("="*80)
     
     return policy
-
-
-# Backward compatibility wrapper
-def train_behavior_cloning(env_factory, policy: DADPolicy, epochs=3, episodes_per_epoch=30, lr=1e-3):
-    """
-    Backward compatibility wrapper.
-    Now uses RL instead of behavior cloning.
-    """
-    print("⚠️  Note: Now using RL training (minimizes MOCU) instead of behavior cloning")
-    
-    # Get surrogate from environment
-    env = env_factory()
-    surrogate = env.surrogate
-    
-    if surrogate is None:
-        raise ValueError("Surrogate model required for DAD RL training")
-    
-    return train_dad_rl(env_factory, policy, surrogate, epochs, episodes_per_epoch, lr)

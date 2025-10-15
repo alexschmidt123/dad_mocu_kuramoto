@@ -32,11 +32,11 @@ surrogate:
   lr: 0.001
   batch_size: 512
 
-dad_bc:
+dad_rl:
   hidden: 128
-  epochs: 5
-  episodes_per_epoch: 30
-  lr: 0.001
+  epochs: 30           # Even more for full config
+  episodes_per_epoch: 50
+  lr: 0.0002     # Changed from 0.001
 
 enable_dad: true
 
