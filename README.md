@@ -85,7 +85,7 @@ dad_mocu_kuramoto/
 ### Setup
 ```bash
 # Clone repository
-git clone <repo-url>
+git clone [<repo-url>](https://github.com/alexschmidt123/dad_mocu_kuramoto)
 cd dad_mocu_kuramoto
 
 # Install PyTorch with CUDA support (optimized for RTX 4090)
