@@ -139,52 +139,12 @@ python test.py --config configs/config.yaml --episodes 100 --save-results result
 - Simulation time: 5.0s
 - Epochs: 100
 
-### Expected Results (50 episodes)
-
-```
-Random:       a_ctrl* = 0.152 ± 0.031
-Fixed Design: a_ctrl* = 0.143 ± 0.028  (↓6%)
-Greedy MPNN:  a_ctrl* = 0.125 ± 0.023  (↓18%)
-DAD:          a_ctrl* = 0.118 ± 0.020  (↓22%)
-```
-
-### Troubleshooting
-
-**Data generation too slow?**
-- Use `--parallel --workers 20` for 15-20× speedup
-- Reduce workers if RAM limited: `--workers 10`
-
-**Out of memory during training?**
-- Reduce batch size in config: `batch_size: 256`
-
-**Test single sample first:**
-```bash
-python generate_data.py --config configs/config_fast.yaml --split train --debug
-```
 
 ## References
 
-### Papers
-
-1. **MOCU Framework for Kuramoto Networks**  
-   Yoon et al. (2021) - *Accelerating Optimal Experimental Design for Robust Synchronization of Uncertain Kuramoto Oscillator Model*  
-   [arXiv:2106.00332](https://arxiv.org/abs/2106.00332)
-
-2. **MPNN Surrogate for OED Acceleration**  
-   Sherry et al. (2023) - *Learning to Accelerate Optimal Experimental Design using Deep Learning*
-
-3. **Deep Adaptive Design (DAD)**  
-   Foster et al. (2021) - *Deep Adaptive Design: Amortizing Sequential Bayesian Experimental Design*  
-   [github.com/ae-foster/dad](https://github.com/ae-foster/dad)
-
-4. **Kuramoto Model**  
-   Kuramoto, Y. (1984) - *Chemical Oscillations, Waves, and Turbulence*
-
-### Related Repositories
-
 - [Kuramoto Model OED Acceleration](https://github.com/bjyoontamu/Kuramoto-Model-OED-acceleration) - Original implementation by Yoon et al.
 - [Deep Adaptive Design](https://github.com/ae-foster/dad) - DAD framework by Foster et al.
-- [Accelerate OED](https://github.com/Levishery/AccelerateOED) - MPNN acceleration by Sherry et al.
+- [Accelerate OED](https://github.com/Levishery/AccelerateOED) - MPNN acceleration by Chen et al.
 
 ## License
 MIT License - Educational and research purposes
