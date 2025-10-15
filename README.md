@@ -1,4 +1,4 @@
-# Deep Adaptive Design for Kuramoto Oscillator Networks
+# Objective-Based Deep Adaptive Design for Kuramoto Oscillator Networks
 
 GPU-accelerated sequential experiment design for learning coupling structures in Kuramoto oscillator networks through active synchronization tests.
 
@@ -36,7 +36,7 @@ $$\text{ERM}(h, \xi) = \mathbb{E}_{y|\xi,h}\left[\text{MOCU}(h \oplus (\xi, y))\
 | **Random** | Uniformly sample candidate pairs at each step | None |
 | **Fixed Design** | Static sequence optimized offline using MPNN greedy | MPNN Surrogate |
 | **Greedy MPNN** | Minimize predicted ERM at each step | MPNN Surrogate |
-| **DAD (Ours)** | Adaptive policy trained on MPNN trajectories | MPNN Surrogate + Policy Network |
+| **DAD with MOCU** | Adaptive policy trained on MPNN trajectories | MPNN Surrogate + Policy Network |
 
 **Note**: 
 - Fixed Design is derived from DAD framework using greedy MPNN selection
@@ -146,5 +146,3 @@ python test.py --config configs/config.yaml --episodes 100 --save-results result
 - [Deep Adaptive Design](https://github.com/ae-foster/dad) - DAD framework by Foster et al.
 - [Accelerate OED](https://github.com/Levishery/AccelerateOED) - MPNN acceleration by Chen et al.
 
-## License
-MIT License - Educational and research purposes
