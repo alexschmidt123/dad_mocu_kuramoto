@@ -61,7 +61,6 @@ dad_mocu_kuramoto/
 ├── generate_data_gpu.py     # GPU-accelerated data generation
 ├── train.py                 # Train all models
 ├── test.py                  # Evaluate trained models
-├── test_gpu.py             # GPU setup verification
 ├── configs/
 │   ├── config.yaml         # Full configuration
 │   └── config_fast.yaml    # Fast configuration (testing)
