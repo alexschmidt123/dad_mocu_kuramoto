@@ -26,16 +26,6 @@ where:
 
 $$\text{ERM}(h, \xi) = \mathbb{E}_{y|\xi,h}\left[\text{MOCU}(h \oplus (\xi, y))\right]$$
 
-## Key Contributions
-
-1. **MPNN Surrogate (2023)**: Message-passing neural network approximates expensive MOCU/ERM computations via Monte Carlo sampling (~1000× speedup over exact computation)
-
-2. **Fixed Design**: Pre-optimized static K-step sequence using offline greedy MPNN-based selection
-
-3. **DAD Policy**: Deep adaptive policy trained via reinforcement learning to minimize final MOCU by sequentially selecting optimal pair tests
-
-4. **GPU Acceleration**: PyCUDA-based batch ODE integration for parallel Kuramoto simulation (10-50× speedup for data generation)
-
 ## Experiment Selection Strategies
 
 | Strategy | Description | Selection Method |

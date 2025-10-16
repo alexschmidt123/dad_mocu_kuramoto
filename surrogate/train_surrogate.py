@@ -495,7 +495,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     norm_path = os.path.join(os.path.dirname(save_path), 'mocu_normalization.pkl')
     with open(norm_path, 'wb') as f:
         pickle.dump({'mean': mocu_mean, 'std': mocu_std}, f)
-    print(f"\n Saved normalization parameters to {norm_path}")
+    print(f"\n Saved normalization parameters to {norm_path}")
     print("="*80 + "\n")
     
     # Initialize model
@@ -507,8 +507,9 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     )
     
     # Store normalization in model for inference
-    model.mocu_mean = mocu_mean
-    model.mocu_std = mocu_std
+    # NEW (correct)
+    model.mocu_mean = torch.tensor(mocu_mean, dtype=torch.float32)
+    model.mocu_std = torch.tensor(mocu_std, dtype=torch.float32)
     
     trainer = SurrogateTrainer(model, device=device)
     print(f"Model parameters: {sum(p.numel() for p in model.parameters())}")
@@ -521,7 +522,7 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     if save_path:
         print(f"Saving model to {save_path}...")
         torch.save(model.state_dict(), save_path)
-        print(" Model saved successfully!")
+        print(" Model saved successfully!")
         print()
     
     return model, results
@@ -548,9 +549,9 @@ def load_surrogate_with_normalization(model_path, hidden=64, dropout=0.1, mocu_s
             norm_params = pickle.load(f)
         model.mocu_mean = norm_params['mean']
         model.mocu_std = norm_params['std']
-        print(f" Loaded normalization: mean={model.mocu_mean:.4f}, std={model.mocu_std:.4f}")
+        print(f" Loaded normalization: mean={model.mocu_mean:.4f}, std={model.mocu_std:.4f}")
     else:
-        print("�  Warning: No normalization file found. Model may not predict correctly.")
+        print("  Warning: No normalization file found. Model may not predict correctly.")
         model.mocu_mean = 0.0
         model.mocu_std = 1.0
     

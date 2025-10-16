@@ -104,88 +104,109 @@ class SyntheticDataGenerator:
         # Safety: ensure non-negative (handles numerical errors)
         return max(0.0, mocu)
     
+    # ADD THESE NEW METHODS:
+    def compute_erm(self, h: History, xi: Tuple[int, int], omega: np.ndarray, 
+                    rng: np.random.Generator) -> float:
+        """
+        Compute true Expected Remaining MOCU for experiment xi.
+        
+        ERM(h, xi) = E_θ[E_y|xi,θ[MOCU(h ⊕ (xi, y))]]
+        """
+        import copy
+        
+        i, j = xi
+        lam = pair_threshold(omega, i, j)
+        erm_values = []
+        
+        for _ in range(self.n_erm_samples):
+            # Sample θ from current belief
+            A_sample = self.sample_theta_from_belief(h, rng)
+            
+            # Determine outcome with this sampled A
+            y_sync = (A_sample[i, j] >= lam)
+            
+            # Create posterior belief
+            h_posterior = copy.deepcopy(h)
+            update_intervals(h_posterior, xi, y_sync, omega)
+            
+            # Compute MOCU of posterior belief
+            posterior_mocu = self.compute_mocu_fixed(h_posterior, omega, rng)
+            erm_values.append(posterior_mocu)
+        
+        return np.mean(erm_values)
+    
+    def compute_all_erm_scores(self, h: History, candidates: List[Tuple[int, int]], 
+                               omega: np.ndarray, rng: np.random.Generator,
+                               max_candidates: int = 10) -> Dict[Tuple[int, int], float]:
+        """
+        Compute ERM for all (or subset of) candidate experiments.
+        """
+        erm_scores = {}
+        
+        # Sample candidates if too many
+        if len(candidates) > max_candidates:
+            selected = rng.choice(len(candidates), size=min(max_candidates, len(candidates)), replace=False)
+            candidates_to_eval = [candidates[i] for i in selected]
+        else:
+            candidates_to_eval = candidates
+        
+        for xi in candidates_to_eval:
+            erm = self.compute_erm(h, xi, omega, rng)
+            erm_scores[xi] = erm
+        
+        return erm_scores
+    
+    # MODIFY the run_experiment_sequence method:
     def run_experiment_sequence(self, omega: np.ndarray, A_true: np.ndarray, 
                                rng: np.random.Generator) -> Dict:
         """
         Run complete K-step experiment sequence.
         
-        CRITICAL: Skip ERM computation during data generation (Chen et al. 2023 approach).
-        ERM is only needed at inference time, not for training the surrogate.
-        This saves ~10x computation time during data generation.
+        Can compute either:
+        - Just MOCU (fast, for surrogate training only)
+        - MOCU + ERM (slower, for proper DAD training)
         """
         h = init_history(self.N, self.prior_bounds)
         experiment_data = []
         
         for step in range(self.K):
-            # Extract belief graph features
             belief_graph = build_belief_graph(h, omega)
-            
-            # Compute MOCU label (expensive but necessary)
             current_mocu = self.compute_mocu_fixed(h, omega, rng)
             
-            # Get candidate pairs
             candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)
                          if not h.tested[i, j]]
             
-            if not candidates:  # All tested, allow retesting
+            if not candidates:
                 candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)]
             
-            # CRITICAL FIX: Skip ERM computation during data generation
-            # ERM is NOT used during surrogate training, only MOCU is
-            # This saves ~10x computation time!
-            # The trained MPNN will compute ERM at inference time
-            erm_scores = {}  # Empty - computed at inference time by trained surrogate
+            # CONDITIONAL ERM computation
+            if self.compute_true_erm:
+                # Compute true ERM (slow but accurate)
+                erm_scores = self.compute_all_erm_scores(h, candidates, omega, rng, max_candidates=10)
+            else:
+                # Skip ERM (fast, Chen et al. 2023 approach)
+                erm_scores = {}
             
-            # Random experiment selection (for diverse training data)
+            # Random experiment selection
             xi = candidates[rng.integers(len(candidates))]
             i, j = xi
             lam = pair_threshold(omega, i, j)
             y_sync = (A_true[i, j] >= lam)
             
-            # Store step data
             step_data = {
                 'belief_graph': belief_graph,
-                'mocu': current_mocu,  # Ground-truth MOCU label
+                'mocu': current_mocu,
                 'candidate_pairs': candidates,
-                'erm_scores': erm_scores,  # Empty dict - not needed for training
+                'erm_scores': erm_scores,  # Will be populated if compute_true_erm=True
                 'chosen_pair': xi,
                 'outcome': y_sync,
                 'step': step
             }
             experiment_data.append(step_data)
             
-            # Update belief based on outcome
             update_intervals(h, xi, y_sync, omega)
         
-        # Final state
-        final_belief_graph = build_belief_graph(h, omega)
-        final_mocu = self.compute_mocu_fixed(h, omega, rng)
-        
-        # Compute final control cost
-        A_min = h.lower.copy()
-        np.fill_diagonal(A_min, 0.0)
-        a_ctrl_star = self.find_optimal_control(A_min, omega)
-        
-        # Sync prediction labels (for surrogate training)
-        sync_scores = {}
-        a_ctrl_values = np.linspace(0.0, 1.0, 10)
-        for a_ctrl in a_ctrl_values:
-            try:
-                syncs = sync_check(A_min, omega, a_ctrl, **self.sim_opts)
-                sync_scores[float(a_ctrl)] = float(syncs)
-            except:
-                sync_scores[float(a_ctrl)] = 0.0
-        
-        return {
-            'experiment_data': experiment_data,
-            'final_belief_graph': final_belief_graph,
-            'final_mocu': final_mocu,
-            'a_ctrl_star': a_ctrl_star,
-            'sync_scores': sync_scores,
-            'omega': omega,
-            'A_true': A_true
-        }
-    
+        # ... rest of the method stays the same ...
     def generate_dataset(self, seed: int = 42) -> List[Dict]:
         """Generate complete training dataset with fixed MOCU."""
         rng = np.random.default_rng(seed)
