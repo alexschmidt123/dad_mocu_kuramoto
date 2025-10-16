@@ -31,6 +31,8 @@ surrogate:
   epochs: 100
   lr: 0.001
   batch_size: 512
+  n_erm_samples: 10    # Number of MC samples for ERM computation
+  max_erm_candidates: 10  # Max candidates to compute ERM for (per step)
 
 dad_rl:
   hidden: 128
