@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
-Evaluation script with progress bars for Kuramoto experiment design methods.
+Comprehensive evaluation of all design strategies:
+1. Random (baseline)
+2. Fixed Design (2023 AccelerateOED)
+3. Greedy MPNN (2023 AccelerateOED)
+4. DAD (MOCU-based adaptation)
 """
 
 import yaml
@@ -9,6 +13,8 @@ import torch
 import argparse
 import os
 import pickle
+import json
+import time
 from typing import Dict, Any, List
 
 from core.kuramoto_env import PairTestEnv
@@ -17,11 +23,9 @@ from design.greedy_erm import choose_next_pair_greedy
 from design.dad_policy import DADPolicy
 from design.train_rl import make_hist_tokens
 from eval.run_eval import run_episode
-from eval.metrics import (print_comparison_results, plot_mocu_curves, 
-                         plot_a_ctrl_distribution, save_results, 
-                         compute_improvement_metrics)
+from core.bisection import find_min_a_ctrl
+from core.pacemaker_control import sync_check
 
-# Try to import tqdm
 try:
     from tqdm import tqdm
     TQDM_AVAILABLE = True
@@ -29,113 +33,17 @@ except ImportError:
     TQDM_AVAILABLE = False
 
 
-def run_multiple_episodes_with_progress(env_factory, chooser_fn, sim_opts, n_episodes=10, 
-                                       strategy_name="Strategy", verbose=False, seed=None):
-    """Run multiple episodes with progress bar."""
-    if seed is not None:
-        np.random.seed(seed)
-    
-    results = []
-    
-    if TQDM_AVAILABLE:
-        pbar = tqdm(range(n_episodes), desc=f"Evaluating {strategy_name}", 
-                   unit="episode", ncols=100,
-                   bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]')
-        
-        for episode in pbar:
-            env = env_factory()
-            result = run_episode(env, chooser_fn, sim_opts, verbose=verbose)
-            results.append(result)
-        
-        pbar.close()
-    else:
-        print(f"\nEvaluating {strategy_name}: {n_episodes} episodes")
-        for episode in range(n_episodes):
-            if (episode + 1) % 10 == 0 or (episode + 1) == n_episodes:
-                progress = (episode + 1) / n_episodes * 100
-                print(f"  [{progress:5.1f}%] {episode+1}/{n_episodes} episodes")
-            
-            env = env_factory()
-            result = run_episode(env, chooser_fn, sim_opts, verbose=verbose)
-            results.append(result)
-    
-    return results
-
-
-def compute_statistics(results: List[Dict]) -> Dict[str, Any]:
-    """Compute statistics from multiple episode results."""
-    a_ctrl_stars = [r['a_ctrl_star'] for r in results]
-    terminal_mocus = [r['terminal_mocu_hat'] for r in results if r['terminal_mocu_hat'] is not None]
-    total_times = [r['total_time'] for r in results]
-    
-    stats = {
-        'n_episodes': len(results),
-        'a_ctrl_star': {
-            'mean': np.mean(a_ctrl_stars),
-            'std': np.std(a_ctrl_stars),
-            'min': np.min(a_ctrl_stars),
-            'max': np.max(a_ctrl_stars),
-            'median': np.median(a_ctrl_stars)
-        },
-        'terminal_mocu': {
-            'mean': np.mean(terminal_mocus) if terminal_mocus else None,
-            'std': np.std(terminal_mocus) if terminal_mocus else None,
-            'min': np.min(terminal_mocus) if terminal_mocus else None,
-            'max': np.max(terminal_mocus) if terminal_mocus else None,
-            'median': np.median(terminal_mocus) if terminal_mocus else None
-        },
-        'total_time': {
-            'mean': np.mean(total_times),
-            'std': np.std(total_times),
-            'min': np.min(total_times),
-            'max': np.max(total_times)
-        }
-    }
-    
-    return stats
-
-
-def compare_strategies_with_progress(env_factory, strategies: Dict, sim_opts, 
-                                     n_episodes=10, verbose=False, seed=None):
-    """Compare multiple strategies with progress bars."""
-    if seed is not None:
-        np.random.seed(seed)
-    
-    comparison_results = {}
-    
-    print("\n" + "="*80)
-    print(f"RUNNING EVALUATION ({n_episodes} episodes per strategy)")
-    print("="*80)
-    
-    for strategy_name, chooser_fn in strategies.items():
-        results = run_multiple_episodes_with_progress(
-            env_factory, chooser_fn, sim_opts, 
-            n_episodes, strategy_name=strategy_name, 
-            verbose=False, seed=None
-        )
-        stats = compute_statistics(results)
-        comparison_results[strategy_name] = {
-            'results': results,
-            'statistics': stats
-        }
-    
-    return comparison_results
-
-
 def load_config(path: str) -> Dict[str, Any]:
-    """Load configuration."""
+    """Load configuration"""
     with open(path, "r") as f:
         return yaml.safe_load(f)
 
 
-def make_env_factory(cfg: Dict, surrogate, seed=0):
-    """Create environment factory."""
-    episode_counter = [0]  # Use list to make it mutable
-    
+def make_env_factory(cfg: Dict, surrogate, episode_counter=[0]):
+    """Create environment factory with unique seeds per episode"""
     def env_factory():
         N, K = cfg["N"], cfg["K"]
-        # Use different seed for each episode
-        episode_seed = cfg["seed"] + seed + episode_counter[0]
+        episode_seed = cfg["seed"] + episode_counter[0]
         episode_counter[0] += 1
         rng = np.random.default_rng(episode_seed)
         
@@ -151,12 +59,12 @@ def make_env_factory(cfg: Dict, surrogate, seed=0):
 
 
 def random_chooser(env, cands):
-    """Random baseline."""
+    """Random baseline"""
     return cands[np.random.randint(len(cands))]
 
 
 def fixed_design_chooser_factory(fixed_sequence):
-    """Fixed design chooser."""
+    """Fixed design chooser"""
     step_counter = [0]
     
     def fixed_chooser(env, cands):
@@ -165,251 +73,412 @@ def fixed_design_chooser_factory(fixed_sequence):
             step_counter[0] += 1
             if chosen in cands:
                 return chosen
-            else:
-                return cands[0]
-        else:
-            return cands[np.random.randint(len(cands))]
+        return cands[0] if cands else (0, 1)
     
     return fixed_chooser
 
 
 def greedy_chooser(env, cands):
-    """Greedy MPNN chooser."""
+    """Greedy MPNN chooser (2023 AccelerateOED)"""
     return choose_next_pair_greedy(env, cands)
 
 
 def dad_chooser_factory(policy: DADPolicy):
-    """DAD policy chooser."""
+    """DAD policy chooser"""
     def dad_chooser(env, cands):
         hist_tokens = make_hist_tokens(env.h, env.N)
         return policy.choose(env, hist_tokens)
     return dad_chooser
 
 
-def scan_models(models_dir: str, cfg: Dict, device: str) -> Dict:
-    """Scan models directory and load available models."""
+def run_episode_with_metrics(env, chooser_fn, sim_opts, compute_intermediate=True):
+    """Run episode and compute comprehensive metrics"""
+    start_time = time.time()
+    
+    intermediate_results = []
+    
+    for step in range(env.K):
+        step_start = time.time()
+        
+        belief_graph = env.features()
+        candidates = env.candidate_pairs()
+        
+        # Compute current MOCU
+        current_mocu = None
+        if env.surrogate is not None:
+            try:
+                current_mocu = env.surrogate.forward_mocu(belief_graph).item()
+            except:
+                pass
+        
+        # Choose and execute
+        xi = chooser_fn(env, candidates)
+        result = env.step(xi)
+        
+        step_time = time.time() - step_start
+        
+        intermediate_results.append({
+            'step': step,
+            'chosen_pair': xi,
+            'outcome': result['y'],
+            'mocu': current_mocu,
+            'step_time': step_time
+        })
+    
+    # Compute terminal metrics
+    A_min = env.h.lower.copy()
+    np.fill_diagonal(A_min, 0.0)
+    
+    def check_fn(a_ctrl):
+        try:
+            return sync_check(A_min, env.omega, a_ctrl, **sim_opts)
+        except:
+            return False
+    
+    try:
+        a_ctrl_star = find_min_a_ctrl(A_min, env.omega, check_fn, tol=0.005, max_iter=30)
+    except:
+        a_ctrl_star = 2.0
+    
+    # Terminal MOCU
+    final_belief_graph = env.features()
+    terminal_mocu = None
+    if env.surrogate is not None:
+        try:
+            terminal_mocu = env.surrogate.forward_mocu(final_belief_graph).item()
+        except:
+            pass
+    
+    total_time = time.time() - start_time
+    
+    return {
+        'a_ctrl_star': a_ctrl_star,
+        'terminal_mocu': terminal_mocu,
+        'intermediate_results': intermediate_results,
+        'total_time': total_time,
+        'A_min': A_min,
+        'A_true': env.A_true
+    }
+
+
+def run_strategy_evaluation(env_factory, chooser_fn, sim_opts, n_episodes, 
+                           strategy_name, verbose=False):
+    """Run evaluation for one strategy with progress bar"""
+    results = []
+    
+    if TQDM_AVAILABLE:
+        pbar = tqdm(range(n_episodes), desc=f"Evaluating {strategy_name}", 
+                   unit="ep", ncols=100,
+                   bar_format='{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+        iterator = pbar
+    else:
+        print(f"\nEvaluating {strategy_name}: {n_episodes} episodes")
+        iterator = range(n_episodes)
+    
+    for ep_idx in iterator:
+        env = env_factory()
+        result = run_episode_with_metrics(env, chooser_fn, sim_opts)
+        results.append(result)
+        
+        if not TQDM_AVAILABLE and (ep_idx + 1) % 10 == 0:
+            print(f"  {ep_idx + 1}/{n_episodes} complete")
+    
+    if TQDM_AVAILABLE:
+        pbar.close()
+    
+    return results
+
+
+def compute_statistics(results: List[Dict]) -> Dict[str, Any]:
+    """Compute comprehensive statistics"""
+    a_ctrl_stars = [r['a_ctrl_star'] for r in results]
+    terminal_mocus = [r['terminal_mocu'] for r in results if r['terminal_mocu'] is not None]
+    total_times = [r['total_time'] for r in results]
+    
+    stats = {
+        'n_episodes': len(results),
+        'a_ctrl_star': {
+            'mean': float(np.mean(a_ctrl_stars)),
+            'std': float(np.std(a_ctrl_stars)),
+            'min': float(np.min(a_ctrl_stars)),
+            'max': float(np.max(a_ctrl_stars)),
+            'median': float(np.median(a_ctrl_stars))
+        },
+        'terminal_mocu': None,
+        'total_time': {
+            'mean': float(np.mean(total_times)),
+            'std': float(np.std(total_times)),
+            'min': float(np.min(total_times)),
+            'max': float(np.max(total_times))
+        }
+    }
+    
+    if terminal_mocus:
+        stats['terminal_mocu'] = {
+            'mean': float(np.mean(terminal_mocus)),
+            'std': float(np.std(terminal_mocus)),
+            'min': float(np.min(terminal_mocus)),
+            'max': float(np.max(terminal_mocus)),
+            'median': float(np.median(terminal_mocus))
+        }
+    
+    return stats
+
+
+def load_models(models_dir: str, cfg: Dict, device: str) -> Dict:
+    """Load all available models"""
     print("\n" + "="*80)
-    print("SCANNING MODELS")
+    print("LOADING MODELS")
     print("="*80)
-    print(f"Models directory: {models_dir}")
     
-    if not os.path.exists(models_dir):
-        print(f"WARNING: Models directory not found: {models_dir}")
-        print("Run train.py first to generate models")
-        return {}
+    models = {}
     
-    available_models = {}
-    
-    # Check for MPNN Surrogate
+    # Load surrogate
     surrogate_path = os.path.join(models_dir, "mpnn_surrogate.pth")
     if os.path.exists(surrogate_path):
-        print(f"Found: mpnn_surrogate.pth")
-        
-        # Try to load with config parameters first
+        print(f"Loading: mpnn_surrogate.pth")
         try:
             surrogate = MPNNSurrogate(
                 mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
                 hidden=cfg["surrogate"]["hidden"],
                 dropout=cfg["surrogate"]["dropout"]
             )
-            surrogate.load_state_dict(torch.load(surrogate_path, map_location=device, weights_only=True))
-            print(f"✓ Loaded with config parameters (hidden={cfg['surrogate']['hidden']})")
-        except RuntimeError as e:
-            if "size mismatch" in str(e):
-                print(f"⚠ Architecture mismatch detected. Trying to detect saved model architecture...")
-                
-                # Load the state dict to inspect the architecture
-                state_dict = torch.load(surrogate_path, map_location=device, weights_only=True)
-                
-                # Detect hidden size from the first layer
-                first_layer_weight = state_dict['node_encoder.net.0.weight']
-                detected_hidden = first_layer_weight.shape[0]
-                
-                print(f"Detected saved model architecture: hidden={detected_hidden}")
-                print(f"Config architecture: hidden={cfg['surrogate']['hidden']}")
-                print(f"Creating model with detected architecture...")
-                
-                # Create model with detected architecture
-                surrogate = MPNNSurrogate(
-                    mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
-                    hidden=detected_hidden,
-                    dropout=cfg["surrogate"]["dropout"]
-                )
-                surrogate.load_state_dict(state_dict)
-                print(f"✓ Loaded with detected parameters (hidden={detected_hidden})")
-            else:
-                raise e
-        
-        surrogate.to(device)
-        surrogate.eval()
-        available_models["surrogate"] = surrogate
+            surrogate.load_state_dict(torch.load(surrogate_path, map_location=device, 
+                                                weights_only=True))
+            surrogate.to(device)
+            surrogate.eval()
+            models["surrogate"] = surrogate
+            print("  SUCCESS")
+        except Exception as e:
+            print(f"  ERROR: {e}")
     else:
         print(f"Not found: mpnn_surrogate.pth")
     
-    # Check for Fixed Design
+    # Load fixed design
     fixed_path = os.path.join(models_dir, "fixed_design.pkl")
     if os.path.exists(fixed_path):
-        print(f"Found: fixed_design.pkl")
+        print(f"Loading: fixed_design.pkl")
         with open(fixed_path, 'rb') as f:
-            fixed_sequence = pickle.load(f)
-        available_models["fixed_design"] = fixed_sequence
+            models["fixed_design"] = pickle.load(f)
+        print(f"  SUCCESS: {models['fixed_design']}")
     else:
         print(f"Not found: fixed_design.pkl")
     
-    # Check for DAD Policy
+    # Load DAD policy
     dad_path = os.path.join(models_dir, "dad_policy.pth")
     if os.path.exists(dad_path):
-        print(f"Found: dad_policy.pth")
-        policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
-        policy.load_state_dict(torch.load(dad_path, map_location='cpu'))
-        policy.eval()
-        available_models["dad_policy"] = policy
+        print(f"Loading: dad_policy.pth")
+        try:
+            policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
+            policy.load_state_dict(torch.load(dad_path, map_location='cpu', 
+                                             weights_only=True))
+            policy.eval()
+            models["dad_policy"] = policy
+            print("  SUCCESS")
+        except Exception as e:
+            print(f"  ERROR: {e}")
     else:
         print(f"Not found: dad_policy.pth")
     
     print("="*80)
-    return available_models
+    return models
 
 
-def build_strategies(available_models: Dict) -> Dict:
-    """Build strategy dictionary from available models."""
+def build_strategies(models: Dict) -> Dict:
+    """Build strategy dictionary"""
     strategies = {}
     
+    # Always available
     strategies["Random"] = random_chooser
     
-    if "fixed_design" in available_models:
-        strategies["Fixed Design"] = fixed_design_chooser_factory(
-            available_models["fixed_design"]
+    # Requires surrogate
+    if "surrogate" in models:
+        strategies["Greedy MPNN (2023)"] = greedy_chooser
+    
+    # Requires fixed design
+    if "fixed_design" in models:
+        strategies["Fixed Design (2023)"] = fixed_design_chooser_factory(
+            models["fixed_design"]
         )
     
-    if "surrogate" in available_models:
-        strategies["Greedy MPNN"] = greedy_chooser
-    
-    if "surrogate" in available_models and "dad_policy" in available_models:
-        strategies["DAD"] = dad_chooser_factory(available_models["dad_policy"])
+    # Requires DAD policy
+    if "dad_policy" in models:
+        strategies["DAD (MOCU-based)"] = dad_chooser_factory(models["dad_policy"])
     
     return strategies
 
 
+def print_results(comparison_results: Dict):
+    """Print formatted results"""
+    print("\n" + "="*80)
+    print("EVALUATION RESULTS")
+    print("="*80)
+    
+    for strategy_name, data in comparison_results.items():
+        stats = data['statistics']
+        print(f"\n{strategy_name}:")
+        print("-" * len(strategy_name))
+        
+        # a_ctrl_star
+        a_ctrl = stats['a_ctrl_star']
+        print(f"  a_ctrl_star: {a_ctrl['mean']:.4f} +/- {a_ctrl['std']:.4f}")
+        print(f"    Range: [{a_ctrl['min']:.4f}, {a_ctrl['max']:.4f}]")
+        print(f"    Median: {a_ctrl['median']:.4f}")
+        
+        # terminal MOCU
+        if stats['terminal_mocu'] is not None:
+            mocu = stats['terminal_mocu']
+            print(f"  Terminal MOCU: {mocu['mean']:.4f} +/- {mocu['std']:.4f}")
+            print(f"    Range: [{mocu['min']:.4f}, {mocu['max']:.4f}]")
+        
+        # Time
+        t = stats['total_time']
+        print(f"  Time per episode: {t['mean']:.2f}s")
+        print(f"  Total episodes: {stats['n_episodes']}")
+
+
+def compute_improvements(comparison_results: Dict) -> Dict:
+    """Compute improvements vs Random baseline"""
+    if "Random" not in comparison_results:
+        return {}
+    
+    baseline = comparison_results["Random"]['statistics']
+    improvements = {}
+    
+    for strategy_name, data in comparison_results.items():
+        if strategy_name == "Random":
+            continue
+        
+        stats = data['statistics']
+        
+        # a_ctrl improvement (lower is better)
+        a_ctrl_improv = ((baseline['a_ctrl_star']['mean'] - 
+                         stats['a_ctrl_star']['mean']) / 
+                        baseline['a_ctrl_star']['mean'] * 100)
+        
+        improvement_data = {
+            'a_ctrl_improvement_pct': a_ctrl_improv
+        }
+        
+        # MOCU improvement (lower is better)
+        if (stats['terminal_mocu'] is not None and 
+            baseline['terminal_mocu'] is not None):
+            mocu_improv = ((baseline['terminal_mocu']['mean'] - 
+                          stats['terminal_mocu']['mean']) / 
+                         baseline['terminal_mocu']['mean'] * 100)
+            improvement_data['mocu_improvement_pct'] = mocu_improv
+        
+        improvements[strategy_name] = improvement_data
+    
+    return improvements
+
+
+def save_results_json(comparison_results: Dict, filepath: str):
+    """Save results to JSON"""
+    # Convert numpy types
+    def convert(obj):
+        if isinstance(obj, (np.ndarray, np.generic)):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: convert(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [convert(item) for item in obj]
+        else:
+            return obj
+    
+    with open(filepath, 'w') as f:
+        json.dump(convert(comparison_results), f, indent=2)
+    print(f"\nResults saved: {filepath}")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate trained models for Kuramoto experiment design"
+        description="Evaluate all design strategies"
     )
-    parser.add_argument("--config", default="configs/config.yaml", help="Config file")
-    parser.add_argument("--episodes", type=int, default=50, help="Number of episodes")
-    parser.add_argument("--models-dir", default="models", help="Models directory")
-    parser.add_argument("--save-results", help="Save results to JSON file")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU mode")
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--episodes", type=int, default=50)
+    parser.add_argument("--models-dir", default="models")
+    parser.add_argument("--output-dir", default="results")
+    parser.add_argument("--cpu", action="store_true")
     
     args = parser.parse_args()
     
-    # Setup device
-    if not args.cpu and torch.cuda.is_available():
-        device = 'cuda'
-        print("Using GPU")
-    else:
-        device = 'cpu'
-        print("Using CPU")
+    # Setup
+    device = 'cpu' if args.cpu else ('cuda' if torch.cuda.is_available() else 'cpu')
+    os.makedirs(args.output_dir, exist_ok=True)
     
     # Load config
-    if not os.path.exists(args.config):
-        print(f"Error: Config file '{args.config}' not found!")
-        return 1
-    
     cfg = load_config(args.config)
     
-    print("\n" + "="*80)
-    print("EVALUATION PIPELINE")
+    print("="*80)
+    print("COMPREHENSIVE EVALUATION")
     print("="*80)
     print(f"Config: {args.config}")
     print(f"Episodes: {args.episodes}")
-    print(f"Models dir: {args.models_dir}")
     print(f"Device: {device.upper()}")
     print("="*80)
     
-    # Scan and load models
-    available_models = scan_models(args.models_dir, cfg, device)
+    # Load models
+    models = load_models(args.models_dir, cfg, device)
     
-    if not available_models:
+    if not models:
         print("\nERROR: No models found!")
-        print("Run train.py first:")
-        print("  python train.py --methods all")
+        print("Run: python train.py --mode dad_with_surrogate")
         return 1
     
     # Build strategies
-    strategies = build_strategies(available_models)
+    strategies = build_strategies(models)
     
     print("\n" + "="*80)
-    print("EVALUATION STRATEGIES")
+    print("STRATEGIES TO EVALUATE")
     print("="*80)
-    print(f"Available strategies: {list(strategies.keys())}")
+    for i, name in enumerate(strategies.keys(), 1):
+        print(f"{i}. {name}")
     print("="*80)
     
     # Create environment factory
-    surrogate = available_models.get("surrogate", None)
+    surrogate = models.get("surrogate", None)
     env_factory = make_env_factory(cfg, surrogate=surrogate)
+    sim_opts = cfg["sim"]
     
-    # Run evaluation with progress bars
-    try:
-        comparison_results = compare_strategies_with_progress(
-            env_factory=env_factory,
-            strategies=strategies,
-            sim_opts=cfg["sim"],
-            n_episodes=args.episodes,
-            verbose=False,
-            seed=42
+    # Run evaluations
+    comparison_results = {}
+    
+    for strategy_name, chooser_fn in strategies.items():
+        results = run_strategy_evaluation(
+            env_factory, chooser_fn, sim_opts, 
+            args.episodes, strategy_name
         )
-        
-        # Print results
+        stats = compute_statistics(results)
+        comparison_results[strategy_name] = {
+            'results': results,
+            'statistics': stats
+        }
+    
+    # Print results
+    print_results(comparison_results)
+    
+    # Compute improvements
+    improvements = compute_improvements(comparison_results)
+    if improvements:
         print("\n" + "="*80)
-        print("RESULTS")
+        print("IMPROVEMENT vs Random Baseline")
         print("="*80)
-        print_comparison_results(comparison_results)
-        
-        # Compute improvements
-        if "Random" in comparison_results and len(comparison_results) > 1:
-            print("\n" + "="*80)
-            print("IMPROVEMENT vs Random Baseline")
-            print("="*80)
-            improvements = compute_improvement_metrics(
-                comparison_results, baseline_strategy="Random"
-            )
-            for strategy, metrics in improvements.items():
-                print(f"\n{strategy}:")
-                if 'mocu_improvement_pct' in metrics:
-                    print(f"  MOCU: {metrics['mocu_improvement_pct']:+.1f}%")
-                print(f"  a_ctrl: {metrics['a_ctrl_improvement_pct']:+.1f}%")
-        
-        # Generate plots
-        print("\n" + "="*80)
-        print("GENERATING PLOTS")
-        print("="*80)
-        try:
-            plot_mocu_curves(comparison_results, save_path="mocu_curves.png")
-            print("Saved: mocu_curves.png")
-            
-            plot_a_ctrl_distribution(comparison_results, 
-                                    save_path="a_ctrl_distribution.png")
-            print("Saved: a_ctrl_distribution.png")
-        except Exception as e:
-            print(f"WARNING: Could not generate plots: {e}")
-        
-        # Save results
-        if args.save_results:
-            save_results(comparison_results, args.save_results)
-            print(f"Saved: {args.save_results}")
-        
-        print("\n" + "="*80)
-        print("EVALUATION COMPLETE")
-        print("="*80)
-        
-        return 0
-        
-    except Exception as e:
-        print(f"\n\nERROR during evaluation: {e}")
-        import traceback
-        traceback.print_exc()
-        return 1
+        for strategy, metrics in improvements.items():
+            print(f"\n{strategy}:")
+            if 'mocu_improvement_pct' in metrics:
+                print(f"  MOCU: {metrics['mocu_improvement_pct']:+.1f}%")
+            print(f"  a_ctrl: {metrics['a_ctrl_improvement_pct']:+.1f}%")
+    
+    # Save results
+    results_path = os.path.join(args.output_dir, "evaluation_results.json")
+    save_results_json(comparison_results, results_path)
+    
+    print("\n" + "="*80)
+    print("EVALUATION COMPLETE")
+    print("="*80)
+    
+    return 0
 
 
 if __name__ == "__main__":

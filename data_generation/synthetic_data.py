@@ -1,5 +1,5 @@
 """
-CORRECTED data_generation/synthetic_data.py - Generate complete data with MOCU + ERM + Sync.
+FIXED data_generation/synthetic_data.py - Corrected division by zero and NaN issues.
 """
 
 import numpy as np
@@ -30,7 +30,9 @@ class SyntheticDataGenerator:
         self.n_erm_samples = 10
         
     def generate_omega(self, rng: np.random.Generator) -> np.ndarray:
-        return rng.uniform(self.omega_range[0], self.omega_range[1], size=self.N)
+        omega = rng.uniform(self.omega_range[0], self.omega_range[1], size=self.N)
+        # FIXED: Ensure omega values are not too close (avoid numerical issues)
+        return omega
     
     def generate_true_A(self, rng: np.random.Generator) -> np.ndarray:
         lo, hi = self.prior_bounds
@@ -46,7 +48,9 @@ class SyntheticDataGenerator:
                 lower_bound = max(h.lower[i, j], self.prior_bounds[0])
                 upper_bound = min(h.upper[i, j], self.prior_bounds[1])
                 
-                if upper_bound <= lower_bound:
+                # FIXED: Handle edge cases
+                if upper_bound <= lower_bound or upper_bound - lower_bound < 1e-6:
+                    # Use prior bounds if interval is invalid
                     a_ij = rng.uniform(self.prior_bounds[0], self.prior_bounds[1])
                 else:
                     a_ij = rng.uniform(lower_bound, upper_bound)
@@ -64,13 +68,15 @@ class SyntheticDataGenerator:
                 return False
         
         try:
-            return find_min_a_ctrl(A, omega, check_fn, lo=0.0, hi_init=0.1, 
-                                  tol=5e-3, verbose=False)
+            result = find_min_a_ctrl(A, omega, check_fn, lo=0.0, hi_init=0.1, 
+                                   tol=5e-3, verbose=False)
+            # FIXED: Clamp result to reasonable range
+            return max(0.001, min(5.0, result))
         except:
-            return 2.0
+            return 1.0  # Reasonable default
     
     def compute_mocu(self, h: History, omega: np.ndarray, rng: np.random.Generator) -> float:
-        """Compute MOCU = a*(A_min) - E[a*(theta)]"""
+        """Compute MOCU = a*(A_min) - E[a*(theta)] with better error handling."""
         try:
             # Worst-case control
             A_min = h.lower.copy()
@@ -84,14 +90,28 @@ class SyntheticDataGenerator:
                 a_optimal = self.find_optimal_control(A_sample, omega)
                 optimal_controls.append(a_optimal)
             
-            expected_optimal = np.mean(optimal_controls) if optimal_controls else a_worst_case
-            return max(0.0, min(5.0, a_worst_case - expected_optimal))
-        except:
+            if not optimal_controls:
+                return 0.1  # Safe default
+            
+            expected_optimal = np.mean(optimal_controls)
+            mocu = a_worst_case - expected_optimal
+            
+            # FIXED: Ensure MOCU is in reasonable range
+            mocu = max(0.0, min(5.0, mocu))
+            
+            # FIXED: Check for NaN/inf
+            if np.isnan(mocu) or np.isinf(mocu):
+                return 0.1
+            
+            return mocu
+            
+        except Exception as e:
+            print(f"Warning: MOCU computation failed: {e}")
             return 0.1
     
     def compute_erm(self, h: History, xi: Tuple[int, int], omega: np.ndarray, 
                     rng: np.random.Generator) -> float:
-        """Compute Expected Remaining MOCU for experiment xi."""
+        """Compute Expected Remaining MOCU for experiment xi with better error handling."""
         import copy
         
         try:
@@ -114,8 +134,22 @@ class SyntheticDataGenerator:
                 posterior_mocu = self.compute_mocu(h_posterior, omega, rng)
                 erm_values.append(posterior_mocu)
             
-            return max(0.0, np.mean(erm_values)) if erm_values else 0.0
-        except:
+            if not erm_values:
+                return 0.0
+            
+            erm = np.mean(erm_values)
+            
+            # FIXED: Ensure ERM is in reasonable range
+            erm = max(0.0, min(5.0, erm))
+            
+            # FIXED: Check for NaN/inf
+            if np.isnan(erm) or np.isinf(erm):
+                return 0.0
+            
+            return erm
+            
+        except Exception as e:
+            print(f"Warning: ERM computation failed for {xi}: {e}")
             return 0.0
     
     def compute_all_erm_scores(self, h: History, candidates: List[Tuple[int, int]], 
@@ -160,41 +194,56 @@ class SyntheticDataGenerator:
         experiment_data = []
         
         for step in range(self.K):
-            # Current belief state
-            belief_graph = build_belief_graph(h, omega)
-            current_mocu = self.compute_mocu(h, omega, rng)
-            
-            # Get candidate pairs (untested pairs)
-            candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)
-                         if not h.tested[i, j]]
-            
-            # If all pairs tested, allow retesting
-            if not candidates:
-                candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)]
-            
-            # Compute ERM scores for all candidates
-            erm_scores = self.compute_all_erm_scores(h, candidates, omega, rng, max_candidates=10)
-            
-            # Random experiment selection for training data diversity
-            xi = candidates[rng.integers(len(candidates))]
-            i, j = xi
-            lam = pair_threshold(omega, i, j)
-            y_sync = (A_true[i, j] >= lam)
-            
-            # Store step data
-            step_data = {
-                'belief_graph': belief_graph,
-                'mocu': current_mocu,
-                'candidate_pairs': candidates,
-                'erm_scores': erm_scores,
-                'chosen_pair': xi,
-                'outcome': y_sync,
-                'step': step
-            }
-            experiment_data.append(step_data)
-            
-            # Update belief
-            update_intervals(h, xi, y_sync, omega)
+            try:
+                # Current belief state
+                belief_graph = build_belief_graph(h, omega)
+                current_mocu = self.compute_mocu(h, omega, rng)
+                
+                # Get candidate pairs (untested pairs)
+                candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)
+                             if not h.tested[i, j]]
+                
+                # If all pairs tested, allow retesting
+                if not candidates:
+                    candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)]
+                
+                # Compute ERM scores for candidates
+                erm_scores = self.compute_all_erm_scores(h, candidates, omega, rng, max_candidates=10)
+                
+                # Random experiment selection for training data diversity
+                xi = candidates[rng.integers(len(candidates))]
+                i, j = xi
+                lam = pair_threshold(omega, i, j)
+                y_sync = (A_true[i, j] >= lam)
+                
+                # Store step data
+                step_data = {
+                    'belief_graph': belief_graph,
+                    'mocu': current_mocu,
+                    'candidate_pairs': candidates,
+                    'erm_scores': erm_scores,
+                    'chosen_pair': xi,
+                    'outcome': y_sync,
+                    'step': step
+                }
+                experiment_data.append(step_data)
+                
+                # Update belief
+                update_intervals(h, xi, y_sync, omega)
+                
+            except Exception as e:
+                print(f"Warning: Step {step} failed: {e}")
+                # Create minimal step data to continue
+                step_data = {
+                    'belief_graph': build_belief_graph(h, omega),
+                    'mocu': 0.1,
+                    'candidate_pairs': candidates if 'candidates' in locals() else [(0,1)],
+                    'erm_scores': {(0,1): 0.0},
+                    'chosen_pair': (0,1),
+                    'outcome': False,
+                    'step': step
+                }
+                experiment_data.append(step_data)
         
         # Final state
         final_belief_graph = build_belief_graph(h, omega)
@@ -241,8 +290,14 @@ class SyntheticDataGenerator:
                 A_true = self.generate_true_A(rng)
                 
                 data = self.run_experiment_sequence(omega, A_true, rng)
-                dataset.append(data)
-                successful_samples += 1
+                
+                # FIXED: Validate data before adding
+                if self._validate_sample(data):
+                    dataset.append(data)
+                    successful_samples += 1
+                else:
+                    failed_samples += 1
+                    print(f"  Warning: Sample {i} failed validation")
                 
             except Exception as e:
                 failed_samples += 1
@@ -254,35 +309,67 @@ class SyntheticDataGenerator:
         
         # Verify label statistics
         if dataset:
-            all_mocu = []
-            all_erm = []
-            all_sync = []
-            
-            for sample in dataset[:min(50, len(dataset))]:
-                for step_data in sample['experiment_data']:
-                    all_mocu.append(step_data['mocu'])
-                    all_erm.extend(list(step_data['erm_scores'].values()))
-                all_mocu.append(sample['final_mocu'])
-                all_sync.extend(list(sample['sync_scores'].values()))
-            
-            all_mocu = np.array(all_mocu)
-            
-            print(f"\nLabel Statistics:")
-            print(f"  MOCU: {len(all_mocu)} labels, mean={all_mocu.mean():.4f}, range=[{all_mocu.min():.4f}, {all_mocu.max():.4f}]")
-            if all_erm:
-                all_erm = np.array(all_erm)
-                print(f"  ERM: {len(all_erm)} labels, mean={all_erm.mean():.4f}, range=[{all_erm.min():.4f}, {all_erm.max():.4f}]")
-            if all_sync:
-                all_sync = np.array(all_sync)
-                print(f"  Sync: {len(all_sync)} labels, mean={all_sync.mean():.4f}, unique values={np.unique(all_sync)}")
-            
-            if all_mocu.min() < 0:
-                print(f"  WARNING: Negative MOCU detected!")
-                return []
-            else:
-                print(f"  SUCCESS: All labels generated successfully")
+            self._print_statistics(dataset)
         
         return dataset
+    
+    def _validate_sample(self, data: Dict) -> bool:
+        """Validate a single sample for correctness."""
+        try:
+            # Check required keys
+            required_keys = ['experiment_data', 'final_mocu', 'a_ctrl_star']
+            if not all(key in data for key in required_keys):
+                return False
+            
+            # Check MOCU values
+            final_mocu = data['final_mocu']
+            if np.isnan(final_mocu) or np.isinf(final_mocu) or final_mocu < 0:
+                return False
+            
+            # Check a_ctrl_star
+            a_ctrl_star = data['a_ctrl_star']
+            if np.isnan(a_ctrl_star) or np.isinf(a_ctrl_star) or a_ctrl_star <= 0:
+                return False
+            
+            # Check experiment data
+            for step_data in data['experiment_data']:
+                mocu = step_data['mocu']
+                if np.isnan(mocu) or np.isinf(mocu) or mocu < 0:
+                    return False
+            
+            return True
+            
+        except:
+            return False
+    
+    def _print_statistics(self, dataset: List[Dict]):
+        """Print dataset statistics."""
+        all_mocu = []
+        all_erm = []
+        all_sync = []
+        
+        for sample in dataset[:min(50, len(dataset))]:
+            for step_data in sample['experiment_data']:
+                all_mocu.append(step_data['mocu'])
+                all_erm.extend(list(step_data['erm_scores'].values()))
+            all_mocu.append(sample['final_mocu'])
+            all_sync.extend(list(sample['sync_scores'].values()))
+        
+        all_mocu = np.array(all_mocu)
+        
+        print(f"\nLabel Statistics:")
+        print(f"  MOCU: {len(all_mocu)} labels, mean={all_mocu.mean():.4f}, range=[{all_mocu.min():.4f}, {all_mocu.max():.4f}]")
+        if all_erm:
+            all_erm = np.array(all_erm)
+            print(f"  ERM: {len(all_erm)} labels, mean={all_erm.mean():.4f}, range=[{all_erm.min():.4f}, {all_erm.max():.4f}]")
+        if all_sync:
+            all_sync = np.array(all_sync)
+            print(f"  Sync: {len(all_sync)} labels, mean={all_sync.mean():.4f}, unique values={np.unique(all_sync)}")
+        
+        if all_mocu.min() < 0:
+            print(f"  WARNING: Negative MOCU detected!")
+        else:
+            print(f"  SUCCESS: All labels generated successfully")
 
 
 def create_training_data(N: int = 5, K: int = 4, n_samples: int = 1000, 

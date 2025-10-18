@@ -74,11 +74,12 @@ class DADPolicy(nn.Module):
         )
 
     def forward(self, belief_graph, cand_pairs, hist_tokens, N):
+        device = next(self.parameters()).device
+        
         z_graph = self.encoder(belief_graph)
         z_hist = self.hist(hist_tokens)
         
         scores = []
-        device = next(self.parameters()).device
         
         # Get node features for candidate encoding
         node_feats = torch.as_tensor(
@@ -88,19 +89,31 @@ class DADPolicy(nn.Module):
         )
         
         for (i, j) in cand_pairs:
-            node_i = node_feats[i]
-            node_j = node_feats[j]
+            # FIXED: Safe indexing
+            if i < node_feats.shape[0] and j < node_feats.shape[0]:
+                node_i = node_feats[i]
+                node_j = node_feats[j]
+            else:
+                # Handle edge case
+                node_i = torch.zeros(node_feats.shape[1], device=device)
+                node_j = torch.zeros(node_feats.shape[1], device=device)
             
+            # FIXED: Safe division
+            norm_factor = max(1.0, N - 1)
             cand = torch.cat([
                 node_i,
                 node_j,
-                torch.tensor([i / (N - 1 + 1e-9), j / (N - 1 + 1e-9)], 
+                torch.tensor([i / norm_factor, j / norm_factor], 
                            dtype=torch.float, device=device)
             ]).unsqueeze(0)
             
             z = torch.cat([z_graph, z_hist, cand], dim=-1)
             score = self.fuse(z).squeeze(1)
             scores.append(score)
+        
+        if not scores:
+            # Handle empty candidates
+            return torch.tensor([], device=device)
         
         scores = torch.cat(scores, dim=0)
         
@@ -109,7 +122,15 @@ class DADPolicy(nn.Module):
         return scores
 
     def choose(self, env, hist_tokens):
+        """Choose the best candidate pair."""
         cands = env.candidate_pairs()
+        if not cands:
+            return (0, 1)  # Default fallback
+        
         g = env.features()
         scores = self.forward(g, cands, hist_tokens, env.N).detach().cpu().numpy()
+        
+        if len(scores) == 0:
+            return cands[0]
+        
         return cands[int(scores.argmin())]
