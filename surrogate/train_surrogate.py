@@ -1,6 +1,5 @@
 """
-Fixed training pipeline for the MPNN surrogate model.
-Uses cached data with proper normalization.
+CORRECTED surrogate/train_surrogate.py - Fixed division by zero errors.
 """
 
 import torch
@@ -50,23 +49,12 @@ class DataCache:
         
         with open(path, 'rb') as f:
             dataset = pickle.load(f)
-        print(f" Loaded {len(dataset)} samples from cache: {path}")
+        print(f"SUCCESS: Loaded {len(dataset)} samples from cache: {path}")
         return dataset
 
 
 def normalize_dataset(dataset, stats=None):
-    """
-    Normalize MOCU labels to mean=0, std=1.
-    
-    Following Chen et al. (2023) methodology for better training convergence.
-    
-    Args:
-        dataset: List of training samples
-        stats: Optional tuple (mean, std) to use. If None, compute from dataset.
-    
-    Returns:
-        normalized_dataset, (mean, std)
-    """
+    """Normalize MOCU labels to mean=0, std=1."""
     # Collect all MOCU values
     all_mocu = []
     for sample in dataset:
@@ -80,7 +68,7 @@ def normalize_dataset(dataset, stats=None):
         std = float(np.std(all_mocu))
         if std < 1e-6:  # Avoid division by zero
             std = 1.0
-            print("  �  WARNING: MOCU has near-zero variance!")
+            print("  WARNING: MOCU has near-zero variance!")
     else:
         mean, std = stats
     
@@ -131,6 +119,7 @@ class SurrogateTrainer:
         for exp_data in dataset:
             for step_data in exp_data['experiment_data']:
                 belief_graph = step_data['belief_graph']
+                # Only add ERM data if it exists
                 for xi, erm_score in step_data['erm_scores'].items():
                     data.append((belief_graph, xi, erm_score))
         return data
@@ -142,8 +131,10 @@ class SurrogateTrainer:
             belief_graph = exp_data['final_belief_graph']
             omega = exp_data['omega']
             
-            for a_ctrl, sync_label in exp_data['sync_scores'].items():
-                data.append((belief_graph, omega, a_ctrl, sync_label))
+            # Only add sync data if it exists
+            if 'sync_scores' in exp_data:
+                for a_ctrl, sync_label in exp_data['sync_scores'].items():
+                    data.append((belief_graph, omega, a_ctrl, sync_label))
         return data
     
     def train_mocu(self, train_data: List[Dict], val_data: List[Dict] = None,
@@ -153,6 +144,10 @@ class SurrogateTrainer:
         
         train_samples = self.prepare_mocu_data(train_data)
         val_samples = self.prepare_mocu_data(val_data) if val_data else None
+        
+        print(f"   Training samples: {len(train_samples)}")
+        if val_samples:
+            print(f"   Validation samples: {len(val_samples)}")
         
         optimizer = optim.Adam(self.model.parameters(), lr=lr)
         criterion = nn.MSELoss()
@@ -195,7 +190,7 @@ class SurrogateTrainer:
                 epoch_loss += loss.item()
                 n_batches += 1
             
-            avg_train_loss = epoch_loss / n_batches
+            avg_train_loss = epoch_loss / n_batches if n_batches > 0 else 0.0
             train_losses.append(avg_train_loss)
             
             # Validation
@@ -223,7 +218,7 @@ class SurrogateTrainer:
                         val_loss += loss.item()
                         n_val_batches += 1
                 
-                avg_val_loss = val_loss / n_val_batches
+                avg_val_loss = val_loss / n_val_batches if n_val_batches > 0 else 0.0
                 val_losses.append(avg_val_loss)
             
             # Update progress bar
@@ -234,10 +229,12 @@ class SurrogateTrainer:
                 epoch_iter.set_description(desc)
             elif (epoch + 1) % 10 == 0:
                 val_str = f", Val Loss = {val_losses[-1]:.4f}" if val_losses else ""
-                print(f"Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.4f}{val_str}")
+                print(f"   Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.4f}{val_str}")
         
         if TQDM_AVAILABLE:
             epoch_iter.close()
+        
+        print(f"MOCU training complete. Final loss: {avg_train_loss:.4f}")
         
         return {'train_losses': train_losses, 'val_losses': val_losses}
     
@@ -248,6 +245,15 @@ class SurrogateTrainer:
         
         train_samples = self.prepare_erm_data(train_data)
         val_samples = self.prepare_erm_data(val_data) if val_data else None
+        
+        print(f"   Training samples: {len(train_samples)}")
+        if val_samples:
+            print(f"   Validation samples: {len(val_samples)}")
+        
+        if len(train_samples) == 0:
+            print("   No ERM training data found. Skipping ERM training.")
+            print("   This is expected if data doesn't include ERM labels.")
+            return {'train_losses': [], 'val_losses': []}
         
         optimizer = optim.Adam(self.model.parameters(), lr=lr)
         criterion = nn.MSELoss()
@@ -286,10 +292,11 @@ class SurrogateTrainer:
                 epoch_loss += loss.item()
                 n_batches += 1
             
-            avg_train_loss = epoch_loss / n_batches
+            # FIXED: Handle division by zero
+            avg_train_loss = epoch_loss / n_batches if n_batches > 0 else 0.0
             train_losses.append(avg_train_loss)
             
-            if val_samples:
+            if val_samples and len(val_samples) > 0:
                 self.model.eval()
                 val_loss = 0.0
                 n_val_batches = 0
@@ -313,12 +320,15 @@ class SurrogateTrainer:
                         val_loss += loss.item()
                         n_val_batches += 1
                 
-                avg_val_loss = val_loss / n_val_batches
+                # FIXED: Handle division by zero
+                avg_val_loss = val_loss / n_val_batches if n_val_batches > 0 else 0.0
                 val_losses.append(avg_val_loss)
             
             if (epoch + 1) % 10 == 0:
                 val_str = f", Val Loss = {val_losses[-1]:.4f}" if val_losses else ""
-                print(f"Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.4f}{val_str}")
+                print(f"   Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.4f}{val_str}")
+        
+        print(f"ERM training complete. Final loss: {avg_train_loss:.4f}")
         
         return {'train_losses': train_losses, 'val_losses': val_losses}
     
@@ -329,6 +339,15 @@ class SurrogateTrainer:
         
         train_samples = self.prepare_sync_data(train_data)
         val_samples = self.prepare_sync_data(val_data) if val_data else None
+        
+        print(f"   Training samples: {len(train_samples)}")
+        if val_samples:
+            print(f"   Validation samples: {len(val_samples)}")
+        
+        if len(train_samples) == 0:
+            print("   No Sync training data found. Skipping Sync training.")
+            print("   This is expected if data doesn't include Sync labels.")
+            return {'train_losses': [], 'val_losses': []}
         
         optimizer = optim.Adam(self.model.parameters(), lr=lr)
         criterion = nn.BCELoss()
@@ -368,10 +387,11 @@ class SurrogateTrainer:
                 epoch_loss += loss.item()
                 n_batches += 1
             
-            avg_train_loss = epoch_loss / n_batches
+            # FIXED: Handle division by zero
+            avg_train_loss = epoch_loss / n_batches if n_batches > 0 else 0.0
             train_losses.append(avg_train_loss)
             
-            if val_samples:
+            if val_samples and len(val_samples) > 0:
                 self.model.eval()
                 val_loss = 0.0
                 n_val_batches = 0
@@ -396,12 +416,15 @@ class SurrogateTrainer:
                         val_loss += loss.item()
                         n_val_batches += 1
                 
-                avg_val_loss = val_loss / n_val_batches
+                # FIXED: Handle division by zero
+                avg_val_loss = val_loss / n_val_batches if n_val_batches > 0 else 0.0
                 val_losses.append(avg_val_loss)
             
             if (epoch + 1) % 10 == 0:
                 val_str = f", Val Loss = {val_losses[-1]:.4f}" if val_losses else ""
-                print(f"Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.4f}{val_str}")
+                print(f"   Epoch {epoch+1}/{epochs}: Train Loss = {avg_train_loss:.4f}{val_str}")
+        
+        print(f"Sync training complete. Final loss: {avg_train_loss:.4f}")
         
         return {'train_losses': train_losses, 'val_losses': val_losses}
     
@@ -469,33 +492,29 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
             val_data = cache.load("val", N, K, n_val, n_theta_samples, 123)
             print()
         except FileNotFoundError as e:
-            print(f"\nL Error: {e}")
+            print(f"\nError: {e}")
             print("\nPlease generate data first:")
-            print("  python generate_data.py --split both --parallel")
+            print("  python generate_data.py --split both")
             raise
     else:
         raise NotImplementedError("On-the-fly data generation not implemented")
     
-    # ============================================================
-    # CRITICAL FIX: Add data normalization here
-    # ============================================================
+    # Normalize data
     print("\n" + "="*80)
-    print("NORMALIZING MOCU LABELS (Chen et al. 2023)")
+    print("NORMALIZING MOCU LABELS")
     print("="*80)
     
-    # Normalize training data and get statistics
     print("Normalizing training data...")
     train_data, (mocu_mean, mocu_std) = normalize_dataset(train_data, stats=None)
     
-    # Normalize validation data using training statistics
     print("\nNormalizing validation data (using training stats)...")
     val_data, _ = normalize_dataset(val_data, stats=(mocu_mean, mocu_std))
     
-    # Save normalization parameters alongside the model
+    # Save normalization parameters
     norm_path = os.path.join(os.path.dirname(save_path), 'mocu_normalization.pkl')
     with open(norm_path, 'wb') as f:
         pickle.dump({'mean': mocu_mean, 'std': mocu_std}, f)
-    print(f"\n Saved normalization parameters to {norm_path}")
+    print(f"\nSaved normalization parameters to {norm_path}")
     print("="*80 + "\n")
     
     # Initialize model
@@ -507,7 +526,6 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     )
     
     # Store normalization in model for inference
-    # NEW (correct)
     model.mocu_mean = torch.tensor(mocu_mean, dtype=torch.float32)
     model.mocu_std = torch.tensor(mocu_std, dtype=torch.float32)
     
@@ -522,53 +540,22 @@ def train_surrogate_model(N: int = 5, K: int = 4, n_train: int = 1000, n_val: in
     if save_path:
         print(f"Saving model to {save_path}...")
         torch.save(model.state_dict(), save_path)
-        print(" Model saved successfully!")
+        print("Model saved successfully!")
         print()
     
     return model, results
 
 
-def load_surrogate_with_normalization(model_path, hidden=64, dropout=0.1, mocu_scale=1.0, device='cpu'):
-    """
-    Load surrogate model and its normalization parameters.
-    
-    The model will automatically denormalize predictions during inference.
-    """
-    # Load model
-    model = MPNNSurrogate(
-        mocu_scale=mocu_scale,
-        hidden=hidden,
-        dropout=dropout
-    )
-    model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-    
-    # Load normalization parameters
-    norm_path = os.path.join(os.path.dirname(model_path), 'mocu_normalization.pkl')
-    if os.path.exists(norm_path):
-        with open(norm_path, 'rb') as f:
-            norm_params = pickle.load(f)
-        model.mocu_mean = norm_params['mean']
-        model.mocu_std = norm_params['std']
-        print(f" Loaded normalization: mean={model.mocu_mean:.4f}, std={model.mocu_std:.4f}")
-    else:
-        print("  Warning: No normalization file found. Model may not predict correctly.")
-        model.mocu_mean = 0.0
-        model.mocu_std = 1.0
-    
-    model.to(device)
-    model.eval()
-    
-    return model
-
-
 if __name__ == "__main__":
-    print("Testing surrogate training with cached data...")
+    print("Testing surrogate training with complete data...")
     model, results = train_surrogate_model(
         N=5, K=4, n_train=100, n_val=20, n_theta_samples=10, 
         epochs=20, device=None, save_path='test_surrogate.pth',
         use_cache=True
     )
-    print("\n Training completed successfully!")
+    print("\nTraining completed successfully!")
     print(f"Final MOCU train loss: {results['mocu']['train_losses'][-1]:.4f}")
-    print(f"Final ERM train loss: {results['erm']['train_losses'][-1]:.4f}")
-    print(f"Final Sync train loss: {results['sync']['train_losses'][-1]:.4f}")
+    if results['erm']['train_losses']:
+        print(f"Final ERM train loss: {results['erm']['train_losses'][-1]:.4f}")
+    if results['sync']['train_losses']:
+        print(f"Final Sync train loss: {results['sync']['train_losses'][-1]:.4f}")

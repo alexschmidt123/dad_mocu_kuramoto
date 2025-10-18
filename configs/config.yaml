@@ -1,5 +1,5 @@
-# RTX 4090 Optimized Configuration
-# Expected runtime: ~8 minutes for full pipeline
+# Updated configs/config.yaml
+# RTX 4090 Optimized Configuration with Two-Stage Data Generation
 
 N: 5                    # Number of oscillators
 K: 4                    # Number of experiments
@@ -21,24 +21,36 @@ sim:
   method: "RK45"
   n_trajectories: 3
 
+# MPNN Surrogate parameters (Stage 1 data)
 surrogate:
   hidden: 128
   dropout: 0.1
   mocu_scale: 1.0
-  n_train: 2000
-  n_val: 400
-  n_theta_samples: 30
+  
+  # Stage 1: Large dataset for surrogate training (MOCU only)
+  n_train: 2000          # Surrogate training samples
+  n_val: 400             # Surrogate validation samples
+  n_theta_samples: 30    # MC samples for MOCU computation
+  
+  # Training parameters
   epochs: 100
   lr: 0.001
   batch_size: 512
-  n_erm_samples: 10    # Number of MC samples for ERM computation
-  max_erm_candidates: 10  # Max candidates to compute ERM for (per step)
+  
+  # Stage 2: ERM computation parameters (for DAD data)
+  n_erm_samples: 10      # MC samples for ERM computation
+  max_erm_candidates: 10 # Max candidates to compute ERM for
 
+# DAD Policy parameters (Stage 2 data)
 dad_rl:
   hidden: 128
-  epochs: 30           # Even more for full config
+  epochs: 30
   episodes_per_epoch: 50
-  lr: 0.0002     # Changed from 0.001
+  lr: 0.0002
+  
+  # Stage 2: Smaller dataset for DAD training (MOCU + ERM)
+  n_train: 500           # DAD training samples (1/4 of surrogate)
+  n_val: 100             # DAD validation samples (1/4 of surrogate)
 
 enable_dad: true
 
@@ -51,6 +63,7 @@ advanced:
   data_gen:
     parallel: false
     cache_labels: true
+    two_stage: true        # Enable two-stage generation
   eval:
     save_trajectories: false
     compute_diagnostics: true

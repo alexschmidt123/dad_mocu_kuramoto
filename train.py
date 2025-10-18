@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Training script for Kuramoto experiment design methods.
+CORRECTED train.py - Simple training for all methods with complete data.
 """
 
 import yaml
@@ -8,6 +8,7 @@ import numpy as np
 import torch
 import argparse
 import os
+import pickle
 from typing import Dict, Any, List
 
 from core.kuramoto_env import PairTestEnv
@@ -73,18 +74,24 @@ def train_surrogate(cfg: Dict, device: str, models_dir: str, force: bool = False
     
     if not force and os.path.exists(model_path):
         print(f"Loading existing model from {model_path}")
-        surrogate = MPNNSurrogate(
-            mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
-            hidden=cfg["surrogate"]["hidden"],
-            dropout=cfg["surrogate"]["dropout"]
-        )
-        surrogate.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
-        surrogate.to(device)
-        surrogate.eval()
-        print("Model loaded\n")
-        return surrogate
+        try:
+            surrogate = MPNNSurrogate(
+                mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
+                hidden=cfg["surrogate"]["hidden"],
+                dropout=cfg["surrogate"]["dropout"]
+            )
+            surrogate.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+            surrogate.to(device)
+            surrogate.eval()
+            print("SUCCESS: Model loaded")
+            return surrogate
+        except Exception as e:
+            print(f"WARNING: Failed to load existing model: {e}")
+            print("Training new model...")
     
     print("Training new surrogate model...")
+    
+    # Use the original train_surrogate_model function
     surrogate, results = train_surrogate_model(
         N=cfg["N"],
         K=cfg["K"],
@@ -102,10 +109,12 @@ def train_surrogate(cfg: Dict, device: str, models_dir: str, force: bool = False
         mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0)
     )
     
-    print(f"Surrogate model saved to {model_path}")
+    print(f"SUCCESS: Surrogate model saved to {model_path}")
     print(f"  Final MOCU loss: {results['mocu']['train_losses'][-1]:.4f}")
-    print(f"  Final ERM loss: {results['erm']['train_losses'][-1]:.4f}")
-    print()
+    if results['erm']['train_losses']:
+        print(f"  Final ERM loss: {results['erm']['train_losses'][-1]:.4f}")
+    if results['sync']['train_losses']:
+        print(f"  Final Sync loss: {results['sync']['train_losses'][-1]:.4f}")
     
     return surrogate
 
@@ -113,8 +122,6 @@ def train_surrogate(cfg: Dict, device: str, models_dir: str, force: bool = False
 def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, 
                        force: bool = False) -> List:
     """Generate fixed design sequence using greedy MPNN."""
-    import pickle
-    
     model_path = os.path.join(models_dir, "fixed_design.pkl")
     
     print("\n" + "="*80)
@@ -125,7 +132,7 @@ def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
         print(f"Loading existing design from {model_path}")
         with open(model_path, 'rb') as f:
             fixed_sequence = pickle.load(f)
-        print(f"Fixed sequence: {fixed_sequence}\n")
+        print(f"SUCCESS: Fixed sequence: {fixed_sequence}")
         return fixed_sequence
     
     print("Generating fixed design sequence using Greedy MPNN...")
@@ -159,14 +166,15 @@ def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
     with open(model_path, 'wb') as f:
         pickle.dump(fixed_sequence, f)
     
-    print(f"Fixed design saved to {model_path}")
-    print(f"  Sequence: {fixed_sequence}\n")
+    print(f"SUCCESS: Fixed design saved to {model_path}")
+    print(f"  Sequence: {fixed_sequence}")
     
     return fixed_sequence
 
+
 def train_dad_policy(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
                      force: bool = False) -> DADPolicy:
-    """Train DAD policy via reinforcement learning to minimize MOCU."""
+    """Train DAD policy via reinforcement learning."""
     model_path = os.path.join(models_dir, "dad_policy.pth")
     
     print("\n" + "="*80)
@@ -175,17 +183,23 @@ def train_dad_policy(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
     
     if not force and os.path.exists(model_path):
         print(f"Loading existing policy from {model_path}")
-        policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
-        policy.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
-        policy.eval()
-        print("Policy loaded\n")
-        return policy
+        try:
+            policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
+            policy.load_state_dict(torch.load(model_path, map_location='cpu', weights_only=True))
+            policy.eval()
+            print("SUCCESS: Policy loaded")
+            return policy
+        except Exception as e:
+            print(f"WARNING: Failed to load existing policy: {e}")
+            print("Training new policy...")
     
-    print("Training DAD policy via RL to minimize MOCU...")
+    print("Training DAD policy via RL...")
+    
+    # Create environment factory that uses the surrogate
     env_factory = make_env_factory(cfg, surrogate=surrogate)
     policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
     
-    # Changed: Import from train_rl instead of train_rl
+    # Import and run RL training
     from design.train_rl import train_dad_rl
     
     policy = train_dad_rl(
@@ -199,14 +213,31 @@ def train_dad_policy(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str,
     
     # Save
     torch.save(policy.state_dict(), model_path)
-    print(f"DAD policy saved to {model_path}\n")
+    print(f"SUCCESS: DAD policy saved to {model_path}")
     
     return policy
+
 
 def main():
     parser = argparse.ArgumentParser(
         description="Train models for Kuramoto experiment design",
-        formatter_class=argparse.RawDescriptionHelpFormatter
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Training Pipeline:
+  1. surrogate: Train MPNN surrogate (MOCU, ERM, Sync prediction)
+  2. fixed: Generate fixed design sequence (requires trained surrogate)
+  3. dad: Train DAD policy (requires trained surrogate)
+
+Examples:
+  # Train only surrogate
+  python train.py --methods surrogate
+  
+  # Train all methods
+  python train.py --methods all
+  
+  # Force retrain everything
+  python train.py --methods all --force
+        """
     )
     parser.add_argument("--config", default="configs/config.yaml", help="Config file")
     parser.add_argument("--methods", nargs="+", 
@@ -237,7 +268,7 @@ def main():
     
     # Load config
     if not os.path.exists(args.config):
-        print(f"Error: Config file '{args.config}' not found!")
+        print(f"ERROR: Config file '{args.config}' not found!")
         return 1
     
     cfg = load_config(args.config)
@@ -273,7 +304,7 @@ def main():
                 surrogate.to(device)
                 surrogate.eval()
             else:
-                print("Error: Surrogate model not found. Train it first:")
+                print("ERROR: Surrogate model not found. Train it first:")
                 print("  python train.py --methods surrogate")
                 return 1
         
@@ -284,17 +315,20 @@ def main():
         
         # Stage 3: DAD Policy
         if "dad" in args.methods:
-            dad_policy = train_dad_policy(cfg, surrogate, args.models_dir, args.force)
-            trained["dad"] = True
+            if not cfg.get("enable_dad", True):
+                print("WARNING: DAD disabled in config, skipping DAD training")
+            else:
+                dad_policy = train_dad_policy(cfg, surrogate, args.models_dir, args.force)
+                trained["dad"] = True
         
         # Summary
         print("\n" + "="*80)
-        print("TRAINING COMPLETE")
+        print("SUCCESS: TRAINING COMPLETE")
         print("="*80)
         print(f"\nTrained methods: {list(trained.keys())}")
         print(f"Models saved in: {args.models_dir}/")
         print("\nFiles:")
-        for filename in os.listdir(args.models_dir):
+        for filename in sorted(os.listdir(args.models_dir)):
             filepath = os.path.join(args.models_dir, filename)
             size_mb = os.path.getsize(filepath) / (1024 * 1024)
             print(f"  {filename} ({size_mb:.2f} MB)")
@@ -305,7 +339,7 @@ def main():
         return 0
         
     except Exception as e:
-        print(f"\n\nError during training: {e}")
+        print(f"\n\nERROR during training: {e}")
         import traceback
         traceback.print_exc()
         return 1

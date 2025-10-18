@@ -1,5 +1,5 @@
-# Fast Configuration for Quick Testing (~30 minutes total)
-# Use this for development and debugging
+# Updated configs/config_fast.yaml
+# Fast Configuration for Quick Testing with Two-Stage Generation
 
 N: 5
 K: 4
@@ -21,24 +21,36 @@ sim:
   method: "RK45"
   n_trajectories: 2   # Reduced from 3
 
+# MPNN Surrogate parameters (Stage 1 data)
 surrogate:
   hidden: 128
   dropout: 0.1
   mocu_scale: 1.0
-  n_train: 500        # Reduced from 2000
-  n_val: 100          # Reduced from 400
-  n_theta_samples: 10 # Reduced from 30 (BIGGEST SPEEDUP)
-  epochs: 50          # Reduced from 100
+  
+  # Stage 1: Smaller dataset for fast testing
+  n_train: 500          # Reduced from 2000
+  n_val: 100            # Reduced from 400
+  n_theta_samples: 10   # Reduced from 30 (BIGGEST SPEEDUP)
+  
+  # Training parameters
+  epochs: 50            # Reduced from 100
   lr: 0.001
   batch_size: 512
-  n_erm_samples: 10    # Number of MC samples for ERM computation
-  max_erm_candidates: 10  # Max candidates to compute ERM for (per step)
   
+  # Stage 2: ERM computation parameters
+  n_erm_samples: 5      # Reduced from 10
+  max_erm_candidates: 8 # Reduced from 10
+
+# DAD Policy parameters (Stage 2 data)
 dad_rl:
   hidden: 128
-  epochs: 20           # Increased for RL
+  epochs: 20            # Reduced
   episodes_per_epoch: 30
-  lr: 0.0003          # Lower LR for stable RL
+  lr: 0.0003
+  
+  # Stage 2: Even smaller dataset for fast testing
+  n_train: 100          # Small for testing
+  n_val: 20             # Small for testing
 
 enable_dad: true
 
@@ -51,6 +63,7 @@ advanced:
   data_gen:
     parallel: false
     cache_labels: true
+    two_stage: true    # Enable two-stage generation
   eval:
     save_trajectories: false
     compute_diagnostics: true
