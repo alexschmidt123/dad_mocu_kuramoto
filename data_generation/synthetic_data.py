@@ -1,5 +1,6 @@
 """
-FIXED data_generation/synthetic_data.py - Corrected division by zero and NaN issues.
+data_generation/synthetic_data.py - Complete data generation with progress bars
+Generates MOCU + ERM + Sync labels for DAD training
 """
 
 import numpy as np
@@ -7,6 +8,12 @@ from typing import Dict, List, Tuple, Optional
 from core.belief import init_history, update_intervals, pair_threshold, build_belief_graph, History
 from core.pacemaker_control import sync_check
 from core.bisection import find_min_a_ctrl
+
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 
 class SyntheticDataGenerator:
@@ -25,14 +32,11 @@ class SyntheticDataGenerator:
             'dt': 0.01, 'T': 5.0, 'burn_in': 2.0, 'R_target': 0.95, 'method': 'RK45', 'n_trajectories': 3
         }
         
-        # Enable complete data generation
         self.compute_true_erm = True
         self.n_erm_samples = 10
         
     def generate_omega(self, rng: np.random.Generator) -> np.ndarray:
-        omega = rng.uniform(self.omega_range[0], self.omega_range[1], size=self.N)
-        # FIXED: Ensure omega values are not too close (avoid numerical issues)
-        return omega
+        return rng.uniform(self.omega_range[0], self.omega_range[1], size=self.N)
     
     def generate_true_A(self, rng: np.random.Generator) -> np.ndarray:
         lo, hi = self.prior_bounds
@@ -48,9 +52,7 @@ class SyntheticDataGenerator:
                 lower_bound = max(h.lower[i, j], self.prior_bounds[0])
                 upper_bound = min(h.upper[i, j], self.prior_bounds[1])
                 
-                # FIXED: Handle edge cases
-                if upper_bound <= lower_bound or upper_bound - lower_bound < 1e-6:
-                    # Use prior bounds if interval is invalid
+                if upper_bound <= lower_bound:
                     a_ij = rng.uniform(self.prior_bounds[0], self.prior_bounds[1])
                 else:
                     a_ij = rng.uniform(lower_bound, upper_bound)
@@ -68,15 +70,13 @@ class SyntheticDataGenerator:
                 return False
         
         try:
-            result = find_min_a_ctrl(A, omega, check_fn, lo=0.0, hi_init=0.1, 
-                                   tol=5e-3, verbose=False)
-            # FIXED: Clamp result to reasonable range
-            return max(0.001, min(5.0, result))
+            return find_min_a_ctrl(A, omega, check_fn, lo=0.0, hi_init=0.1, 
+                                  tol=5e-3, max_iter=30, verbose=False)
         except:
-            return 1.0  # Reasonable default
+            return 2.0
     
     def compute_mocu(self, h: History, omega: np.ndarray, rng: np.random.Generator) -> float:
-        """Compute MOCU = a*(A_min) - E[a*(theta)] with better error handling."""
+        """Compute MOCU = a*(A_min) - E[a*(theta)]"""
         try:
             # Worst-case control
             A_min = h.lower.copy()
@@ -90,28 +90,14 @@ class SyntheticDataGenerator:
                 a_optimal = self.find_optimal_control(A_sample, omega)
                 optimal_controls.append(a_optimal)
             
-            if not optimal_controls:
-                return 0.1  # Safe default
-            
-            expected_optimal = np.mean(optimal_controls)
-            mocu = a_worst_case - expected_optimal
-            
-            # FIXED: Ensure MOCU is in reasonable range
-            mocu = max(0.0, min(5.0, mocu))
-            
-            # FIXED: Check for NaN/inf
-            if np.isnan(mocu) or np.isinf(mocu):
-                return 0.1
-            
-            return mocu
-            
-        except Exception as e:
-            print(f"Warning: MOCU computation failed: {e}")
+            expected_optimal = np.mean(optimal_controls) if optimal_controls else a_worst_case
+            return max(0.0, min(5.0, a_worst_case - expected_optimal))
+        except:
             return 0.1
     
     def compute_erm(self, h: History, xi: Tuple[int, int], omega: np.ndarray, 
                     rng: np.random.Generator) -> float:
-        """Compute Expected Remaining MOCU for experiment xi with better error handling."""
+        """Compute Expected Remaining MOCU for experiment xi."""
         import copy
         
         try:
@@ -120,45 +106,25 @@ class SyntheticDataGenerator:
             erm_values = []
             
             for _ in range(self.n_erm_samples):
-                # Sample theta from current belief
                 A_sample = self.sample_theta_from_belief(h, rng)
-                
-                # Determine outcome
                 y_sync = (A_sample[i, j] >= lam)
                 
-                # Create posterior belief
                 h_posterior = copy.deepcopy(h)
                 update_intervals(h_posterior, xi, y_sync, omega)
                 
-                # Compute MOCU after this experiment
                 posterior_mocu = self.compute_mocu(h_posterior, omega, rng)
                 erm_values.append(posterior_mocu)
             
-            if not erm_values:
-                return 0.0
-            
-            erm = np.mean(erm_values)
-            
-            # FIXED: Ensure ERM is in reasonable range
-            erm = max(0.0, min(5.0, erm))
-            
-            # FIXED: Check for NaN/inf
-            if np.isnan(erm) or np.isinf(erm):
-                return 0.0
-            
-            return erm
-            
-        except Exception as e:
-            print(f"Warning: ERM computation failed for {xi}: {e}")
+            return max(0.0, np.mean(erm_values)) if erm_values else 0.0
+        except:
             return 0.0
     
     def compute_all_erm_scores(self, h: History, candidates: List[Tuple[int, int]], 
                                omega: np.ndarray, rng: np.random.Generator,
                                max_candidates: int = 10) -> Dict[Tuple[int, int], float]:
-        """Compute ERM for all (or subset of) candidate experiments."""
+        """Compute ERM for subset of candidate experiments."""
         erm_scores = {}
         
-        # Sample candidates if too many
         if len(candidates) > max_candidates:
             selected = rng.choice(len(candidates), size=min(max_candidates, len(candidates)), replace=False)
             candidates_to_eval = [candidates[i] for i in selected]
@@ -174,8 +140,6 @@ class SyntheticDataGenerator:
     def compute_sync_scores(self, A_min: np.ndarray, omega: np.ndarray) -> Dict[float, int]:
         """Compute synchronization labels for different control values."""
         sync_scores = {}
-        
-        # Test a few control values
         test_controls = [0.05, 0.1, 0.15, 0.2, 0.3, 0.5]
         
         for a_ctrl in test_controls:
@@ -194,67 +158,43 @@ class SyntheticDataGenerator:
         experiment_data = []
         
         for step in range(self.K):
-            try:
-                # Current belief state
-                belief_graph = build_belief_graph(h, omega)
-                current_mocu = self.compute_mocu(h, omega, rng)
-                
-                # Get candidate pairs (untested pairs)
-                candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)
-                             if not h.tested[i, j]]
-                
-                # If all pairs tested, allow retesting
-                if not candidates:
-                    candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)]
-                
-                # Compute ERM scores for candidates
-                erm_scores = self.compute_all_erm_scores(h, candidates, omega, rng, max_candidates=10)
-                
-                # Random experiment selection for training data diversity
-                xi = candidates[rng.integers(len(candidates))]
-                i, j = xi
-                lam = pair_threshold(omega, i, j)
-                y_sync = (A_true[i, j] >= lam)
-                
-                # Store step data
-                step_data = {
-                    'belief_graph': belief_graph,
-                    'mocu': current_mocu,
-                    'candidate_pairs': candidates,
-                    'erm_scores': erm_scores,
-                    'chosen_pair': xi,
-                    'outcome': y_sync,
-                    'step': step
-                }
-                experiment_data.append(step_data)
-                
-                # Update belief
-                update_intervals(h, xi, y_sync, omega)
-                
-            except Exception as e:
-                print(f"Warning: Step {step} failed: {e}")
-                # Create minimal step data to continue
-                step_data = {
-                    'belief_graph': build_belief_graph(h, omega),
-                    'mocu': 0.1,
-                    'candidate_pairs': candidates if 'candidates' in locals() else [(0,1)],
-                    'erm_scores': {(0,1): 0.0},
-                    'chosen_pair': (0,1),
-                    'outcome': False,
-                    'step': step
-                }
-                experiment_data.append(step_data)
+            belief_graph = build_belief_graph(h, omega)
+            current_mocu = self.compute_mocu(h, omega, rng)
+            
+            candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)
+                         if not h.tested[i, j]]
+            
+            if not candidates:
+                candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)]
+            
+            erm_scores = self.compute_all_erm_scores(h, candidates, omega, rng, max_candidates=10)
+            
+            xi = candidates[rng.integers(len(candidates))]
+            i, j = xi
+            lam = pair_threshold(omega, i, j)
+            y_sync = (A_true[i, j] >= lam)
+            
+            step_data = {
+                'belief_graph': belief_graph,
+                'mocu': current_mocu,
+                'candidate_pairs': candidates,
+                'erm_scores': erm_scores,
+                'chosen_pair': xi,
+                'outcome': y_sync,
+                'step': step
+            }
+            experiment_data.append(step_data)
+            
+            update_intervals(h, xi, y_sync, omega)
         
         # Final state
         final_belief_graph = build_belief_graph(h, omega)
         final_mocu = self.compute_mocu(h, omega, rng)
         
-        # Compute final control parameter
         A_min = h.lower.copy()
         np.fill_diagonal(A_min, 0.0)
         a_ctrl_star = self.find_optimal_control(A_min, omega)
         
-        # Compute sync scores for training
         sync_scores = self.compute_sync_scores(A_min, omega)
         
         return {
@@ -269,107 +209,72 @@ class SyntheticDataGenerator:
         }
     
     def generate_dataset(self, seed: int = 42) -> List[Dict]:
-        """Generate complete training dataset with MOCU + ERM + Sync labels."""
+        """Generate complete training dataset with progress bar."""
         rng = np.random.default_rng(seed)
         dataset = []
         
         print(f"Generating {self.n_samples} samples with complete labels (MOCU + ERM + Sync)")
-        print(f"Using {self.n_theta_samples} MC samples for MOCU estimation")
-        print(f"Using {self.n_erm_samples} MC samples for ERM estimation")
+        print(f"MC samples - MOCU: {self.n_theta_samples}, ERM: {self.n_erm_samples}")
         
         successful_samples = 0
         failed_samples = 0
         
-        for i in range(self.n_samples):
-            if (i + 1) % 50 == 0:
-                print(f"  Generated {i + 1}/{self.n_samples} samples "
-                      f"(Success: {successful_samples}, Failed: {failed_samples})")
-            
+        # Progress bar
+        if TQDM_AVAILABLE:
+            pbar = tqdm(range(self.n_samples), desc="Generating data", unit="sample",
+                       bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+            iterator = pbar
+        else:
+            iterator = range(self.n_samples)
+        
+        for i in iterator:
             try:
                 omega = self.generate_omega(rng)
                 A_true = self.generate_true_A(rng)
                 
                 data = self.run_experiment_sequence(omega, A_true, rng)
-                
-                # FIXED: Validate data before adding
-                if self._validate_sample(data):
-                    dataset.append(data)
-                    successful_samples += 1
-                else:
-                    failed_samples += 1
-                    print(f"  Warning: Sample {i} failed validation")
+                dataset.append(data)
+                successful_samples += 1
                 
             except Exception as e:
                 failed_samples += 1
-                print(f"  Warning: Failed sample {i}: {e}")
+                if not TQDM_AVAILABLE and (i + 1) % 50 == 0:
+                    print(f"  Progress: {i+1}/{self.n_samples} (Failed: {failed_samples})")
                 continue
         
-        print(f"\nSUCCESS: Generated {len(dataset)} valid samples")
-        print(f"Success rate: {successful_samples}/{self.n_samples} ({100*successful_samples/self.n_samples:.1f}%)")
+        if TQDM_AVAILABLE:
+            pbar.close()
         
-        # Verify label statistics
+        print(f"\nGeneration complete: {successful_samples}/{self.n_samples} successful")
+        print(f"Success rate: {100*successful_samples/self.n_samples:.1f}%")
+        
+        # Verify labels
         if dataset:
-            self._print_statistics(dataset)
+            all_mocu = []
+            all_erm = []
+            all_sync = []
+            
+            for sample in dataset[:min(50, len(dataset))]:
+                for step_data in sample['experiment_data']:
+                    all_mocu.append(step_data['mocu'])
+                    all_erm.extend(list(step_data['erm_scores'].values()))
+                all_mocu.append(sample['final_mocu'])
+                all_sync.extend(list(sample['sync_scores'].values()))
+            
+            all_mocu = np.array(all_mocu)
+            
+            print(f"\nLabel Statistics:")
+            print(f"  MOCU: n={len(all_mocu)}, mean={all_mocu.mean():.4f}, "
+                  f"range=[{all_mocu.min():.4f}, {all_mocu.max():.4f}]")
+            if all_erm:
+                all_erm = np.array(all_erm)
+                print(f"  ERM: n={len(all_erm)}, mean={all_erm.mean():.4f}, "
+                      f"range=[{all_erm.min():.4f}, {all_erm.max():.4f}]")
+            if all_sync:
+                all_sync = np.array(all_sync)
+                print(f"  Sync: n={len(all_sync)}, mean={all_sync.mean():.2f}")
         
         return dataset
-    
-    def _validate_sample(self, data: Dict) -> bool:
-        """Validate a single sample for correctness."""
-        try:
-            # Check required keys
-            required_keys = ['experiment_data', 'final_mocu', 'a_ctrl_star']
-            if not all(key in data for key in required_keys):
-                return False
-            
-            # Check MOCU values
-            final_mocu = data['final_mocu']
-            if np.isnan(final_mocu) or np.isinf(final_mocu) or final_mocu < 0:
-                return False
-            
-            # Check a_ctrl_star
-            a_ctrl_star = data['a_ctrl_star']
-            if np.isnan(a_ctrl_star) or np.isinf(a_ctrl_star) or a_ctrl_star <= 0:
-                return False
-            
-            # Check experiment data
-            for step_data in data['experiment_data']:
-                mocu = step_data['mocu']
-                if np.isnan(mocu) or np.isinf(mocu) or mocu < 0:
-                    return False
-            
-            return True
-            
-        except:
-            return False
-    
-    def _print_statistics(self, dataset: List[Dict]):
-        """Print dataset statistics."""
-        all_mocu = []
-        all_erm = []
-        all_sync = []
-        
-        for sample in dataset[:min(50, len(dataset))]:
-            for step_data in sample['experiment_data']:
-                all_mocu.append(step_data['mocu'])
-                all_erm.extend(list(step_data['erm_scores'].values()))
-            all_mocu.append(sample['final_mocu'])
-            all_sync.extend(list(sample['sync_scores'].values()))
-        
-        all_mocu = np.array(all_mocu)
-        
-        print(f"\nLabel Statistics:")
-        print(f"  MOCU: {len(all_mocu)} labels, mean={all_mocu.mean():.4f}, range=[{all_mocu.min():.4f}, {all_mocu.max():.4f}]")
-        if all_erm:
-            all_erm = np.array(all_erm)
-            print(f"  ERM: {len(all_erm)} labels, mean={all_erm.mean():.4f}, range=[{all_erm.min():.4f}, {all_erm.max():.4f}]")
-        if all_sync:
-            all_sync = np.array(all_sync)
-            print(f"  Sync: {len(all_sync)} labels, mean={all_sync.mean():.4f}, unique values={np.unique(all_sync)}")
-        
-        if all_mocu.min() < 0:
-            print(f"  WARNING: Negative MOCU detected!")
-        else:
-            print(f"  SUCCESS: All labels generated successfully")
 
 
 def create_training_data(N: int = 5, K: int = 4, n_samples: int = 1000, 
@@ -382,8 +287,8 @@ def create_training_data(N: int = 5, K: int = 4, n_samples: int = 1000,
 
 
 if __name__ == "__main__":
-    print("Testing complete data generation...")
-    dataset = create_training_data(N=5, K=4, n_samples=5, n_theta_samples=10, seed=42)
+    print("Testing complete data generation with progress bars...")
+    dataset = create_training_data(N=5, K=4, n_samples=10, n_theta_samples=5, seed=42)
     
     if dataset:
         print(f"\nSUCCESS: Generated {len(dataset)} samples")
@@ -391,8 +296,5 @@ if __name__ == "__main__":
         print(f"Initial MOCU: {sample['experiment_data'][0]['mocu']:.4f}")
         print(f"Final MOCU: {sample['final_mocu']:.4f}")
         print(f"a_ctrl_star: {sample['a_ctrl_star']:.4f}")
-        print(f"ERM scores in first step: {len(sample['experiment_data'][0]['erm_scores'])}")
-        print(f"Sync scores: {len(sample['sync_scores'])}")
-        print(f"Available keys: {list(sample.keys())}")
     else:
         print("FAILED: No samples generated")

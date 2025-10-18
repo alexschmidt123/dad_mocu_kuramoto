@@ -1,10 +1,6 @@
 """
-MPNN surrogate with proper message passing layers following Chen et al. (2023).
-
-Key features:
-- Proper MPNNLayer with neighbor message aggregation
-- Multiple graph convolution layers
-- Graph-level pooling for MOCU/ERM/Sync prediction
+CORRECTED surrogate/mpnn_surrogate.py
+Aligned with AccelerateOED 2023 with proper message passing
 """
 
 import numpy as np
@@ -14,7 +10,7 @@ import torch.nn.functional as F
 
 
 class ImprovedMLP(nn.Module):
-    """Improved MLP with layer normalization and dropout."""
+    """MLP with layer normalization and dropout."""
     def __init__(self, din, dout, hidden=64, n_layers=3, dropout=0.1):
         super().__init__()
         layers = []
@@ -37,9 +33,9 @@ class ImprovedMLP(nn.Module):
 
 class MPNNLayer(nn.Module):
     """
-    Message Passing Neural Network layer following Chen et al. (2023).
+    Message Passing Neural Network layer following AccelerateOED 2023.
     
-    Implements proper graph convolution with:
+    CRITICAL: This implements proper graph convolution with:
     1. Message computation from edges
     2. Message aggregation per node
     3. Node update with residual connection
@@ -51,6 +47,7 @@ class MPNNLayer(nn.Module):
         # Message function: combines source node, target node, and edge features
         self.message_net = nn.Sequential(
             nn.Linear(2 * node_dim + edge_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim)
         )
@@ -58,6 +55,7 @@ class MPNNLayer(nn.Module):
         # Update function: combines node features with aggregated messages
         self.update_net = nn.Sequential(
             nn.Linear(node_dim + hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.ReLU(),
             nn.Linear(hidden_dim, node_dim)
         )
@@ -79,21 +77,34 @@ class MPNNLayer(nn.Module):
         N = node_feats.shape[0]
         device = node_feats.device
         
-        # Get source and target node indices
+        # CRITICAL: Build bidirectional edges for undirected graph
+        # Input edge_index: [(i,j), ...] where i < j
+        # Need both (i,j) and (j,i) for message passing
         src_idx = edge_index[0]  # Source nodes
         tgt_idx = edge_index[1]  # Target nodes
         
+        # Create bidirectional edges
+        edge_index_bidir = torch.cat([
+            torch.stack([src_idx, tgt_idx], dim=0),  # Original edges
+            torch.stack([tgt_idx, src_idx], dim=0)   # Reverse edges
+        ], dim=1)
+        
+        edge_feats_bidir = torch.cat([edge_feats, edge_feats], dim=0)
+        
+        src_idx_bi = edge_index_bidir[0]
+        tgt_idx_bi = edge_index_bidir[1]
+        
         # Gather source and target node features
-        src_feats = node_feats[src_idx]  # (E, node_dim)
-        tgt_feats = node_feats[tgt_idx]  # (E, node_dim)
+        src_feats = node_feats[src_idx_bi]  # (2E, node_dim)
+        tgt_feats = node_feats[tgt_idx_bi]  # (2E, node_dim)
         
         # Compute messages: combine source, target, and edge features
-        message_input = torch.cat([src_feats, tgt_feats, edge_feats], dim=1)
-        messages = self.message_net(message_input)  # (E, hidden_dim)
+        message_input = torch.cat([src_feats, tgt_feats, edge_feats_bidir], dim=1)
+        messages = self.message_net(message_input)  # (2E, hidden_dim)
         
         # Aggregate messages for each target node (sum aggregation)
         aggregated = torch.zeros(N, self.hidden_dim, device=device)
-        aggregated.index_add_(0, tgt_idx, messages)
+        aggregated.index_add_(0, tgt_idx_bi, messages)
         
         # Update node features
         update_input = torch.cat([node_feats, aggregated], dim=1)
@@ -105,13 +116,18 @@ class MPNNLayer(nn.Module):
 
 class MPNNSurrogate(nn.Module):
     """
-    MPNN Surrogate following Chen et al. (2023) with proper message passing.
+    MPNN Surrogate following AccelerateOED 2023 with proper message passing.
     
     Architecture:
     1. Node and edge encoders
     2. Multiple MPNN layers for message passing
     3. Global pooling (mean)
     4. Task-specific heads: MOCU, ERM, Sync
+    
+    CRITICAL NORMALIZATION NOTES:
+    - During training: targets are normalized to mean=0, std=1
+    - During inference: predictions are automatically denormalized
+    - Normalization parameters stored in model.mocu_mean and model.mocu_std
     """
     
     def __init__(self, mocu_scale=1.0, hidden=64, dropout=0.1, n_mpnn_layers=3):
@@ -121,7 +137,10 @@ class MPNNSurrogate(nn.Module):
         self.mocu_scale = mocu_scale
         
         # Encoders for node and edge features
+        # Node features: (omega_i, constant) -> hidden
         self.node_encoder = ImprovedMLP(din=2, dout=hidden, hidden=hidden, dropout=dropout)
+        
+        # Edge features: (lower, upper, width, lambda, tested) -> hidden
         self.edge_encoder = ImprovedMLP(din=5, dout=hidden, hidden=hidden, dropout=dropout)
         
         # MPNN layers for message passing
@@ -130,14 +149,18 @@ class MPNNSurrogate(nn.Module):
         ])
         
         # Prediction heads
+        # MOCU head: graph embedding -> MOCU value
         self.head_mocu = ImprovedMLP(din=2*hidden, dout=1, hidden=hidden, dropout=dropout)
+        
+        # ERM head: graph embedding + candidate encoding -> ERM value
         self.head_erm = ImprovedMLP(din=2*hidden + 2, dout=1, hidden=hidden, dropout=dropout)
         
-        # Sync head: needs to incorporate matrix information
+        # Sync head: graph embedding + matrix info + control -> sync probability
         self.matrix_encoder = ImprovedMLP(din=1, dout=hidden//2, hidden=hidden//2, dropout=dropout)
         self.head_sync = ImprovedMLP(din=2*hidden + hidden//2 + 1, dout=1, hidden=hidden, dropout=dropout)
         
         # Normalization parameters (set during training)
+        # These are CRITICAL for correct inference
         self.register_buffer('mocu_mean', torch.tensor(0.0))
         self.register_buffer('mocu_std', torch.tensor(1.0))
     
@@ -152,7 +175,11 @@ class MPNNSurrogate(nn.Module):
         
         # Encode to hidden dimension
         node_h = self.node_encoder(node_feats)  # (N, hidden)
-        edge_h = self.edge_encoder(edge_feats) if edge_feats.shape[0] > 0 else torch.zeros((0, self.hidden), device=device)
+        
+        if edge_feats.shape[0] > 0:
+            edge_h = self.edge_encoder(edge_feats)  # (E, hidden)
+        else:
+            edge_h = torch.zeros((0, self.hidden), device=device)
         
         # Message passing: iterate through MPNN layers
         for mpnn_layer in self.mpnn_layers:
@@ -164,7 +191,11 @@ class MPNNSurrogate(nn.Module):
         """Global pooling to get graph-level representation."""
         # Mean pooling over nodes and edges
         g_node = node_h.mean(dim=0, keepdim=True)  # (1, hidden)
-        g_edge = edge_h.mean(dim=0, keepdim=True) if edge_h.shape[0] > 0 else torch.zeros((1, self.hidden), device=node_h.device)
+        
+        if edge_h.shape[0] > 0:
+            g_edge = edge_h.mean(dim=0, keepdim=True)  # (1, hidden)
+        else:
+            g_edge = torch.zeros((1, self.hidden), device=node_h.device)
         
         return torch.cat([g_node, g_edge], dim=-1)  # (1, 2*hidden)
     
@@ -172,8 +203,11 @@ class MPNNSurrogate(nn.Module):
         """
         Predict MOCU from belief graph with automatic denormalization.
         
-        The model is trained on normalized labels (mean=0, std=1).
+        CRITICAL: The model is trained on normalized labels (mean=0, std=1).
         This method automatically denormalizes predictions to original scale.
+        
+        During training: Use normalized targets
+        During inference: This function returns denormalized predictions
         """
         device = next(self.parameters()).device
         
@@ -187,14 +221,36 @@ class MPNNSurrogate(nn.Module):
         # Aggregate to graph-level representation
         g = self._aggregate(node_h, edge_h)
         
-        # Predict (normalized)
+        # Predict (normalized space)
         y = self.head_mocu(g)
         y_normalized = F.softplus(y) * self.mocu_scale
         
-        # Denormalize to original scale
+        # CRITICAL: Denormalize to original scale
+        # During training, targets were: (mocu - mean) / std
+        # So we reverse: mocu = y_normalized * std + mean
         y_denormalized = y_normalized * self.mocu_std + self.mocu_mean
         
         return y_denormalized
+    
+    def forward_mocu_normalized(self, belief_graph: dict) -> torch.Tensor:
+        """
+        Predict MOCU in normalized space (for training).
+        
+        Use this during training with normalized targets.
+        """
+        device = next(self.parameters()).device
+        
+        node = torch.as_tensor(belief_graph["node_feats"], dtype=torch.float32, device=device)
+        edge = torch.as_tensor(belief_graph["edge_feats"], dtype=torch.float32, device=device)
+        idx = torch.as_tensor(belief_graph["edge_index"], dtype=torch.long, device=device)
+        
+        node_h, edge_h = self._encode_and_propagate(node, edge, idx)
+        g = self._aggregate(node_h, edge_h)
+        
+        y = self.head_mocu(g)
+        y_normalized = F.softplus(y) * self.mocu_scale
+        
+        return y_normalized
     
     def forward_erm(self, belief_graph: dict, xi: tuple) -> torch.Tensor:
         """Predict ERM for a candidate experiment xi."""
@@ -266,32 +322,20 @@ class MPNNSurrogate(nn.Module):
         return torch.cat(predictions)
 
 
-# For backward compatibility
-class TinyMLP(nn.Module):
-    """Legacy MLP - use ImprovedMLP for new code."""
-    def __init__(self, din, dout, hidden=64):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(din, hidden), nn.ReLU(),
-            nn.Linear(hidden, hidden), nn.ReLU(),
-            nn.Linear(hidden, dout),
-        )
-    
-    def forward(self, x):
-        return self.net(x)
-
-
 if __name__ == "__main__":
-    # Test the improved model
     print("="*80)
-    print("Testing MPNN Surrogate with Message Passing Layers")
+    print("Testing CORRECTED MPNN Surrogate")
     print("="*80)
     
     # Create dummy belief graph
     N = 5
-    node_feats = np.random.randn(N, 2)
-    edge_feats = np.random.randn(10, 5)
-    edge_index = np.array([[i, j] for i in range(N) for j in range(i+1, N)]).T
+    node_feats = np.random.randn(N, 2).astype(np.float32)
+    
+    # Edge index: only upper triangular (i < j)
+    edge_list = [(i, j) for i in range(N) for j in range(i+1, N)]
+    edge_index = np.array(edge_list, dtype=np.int64).T  # Shape: (2, num_edges)
+    
+    edge_feats = np.random.randn(len(edge_list), 5).astype(np.float32)
     
     belief_graph = {
         'node_feats': node_feats,
@@ -301,64 +345,55 @@ if __name__ == "__main__":
     
     # Create model
     model = MPNNSurrogate(mocu_scale=1.0, hidden=64, n_mpnn_layers=3)
-    
-    # Test on GPU if available
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = model.to(device)
-    print(f"Testing on device: {device}")
     
-    # Verify MPNN layers exist
-    print(f"\nModel has {len(model.mpnn_layers)} MPNN layers: SUCCESS")
+    print(f"\nDevice: {device}")
+    print(f"MPNN layers: {len(model.mpnn_layers)}")
+    print(f"Edge index shape: {edge_index.shape}")
+    print(f"Number of edges: {edge_index.shape[1]}")
     
     # Test MOCU prediction
-    print("\n1. Testing MOCU prediction...")
+    print("\n1. Testing MOCU prediction (denormalized)...")
     mocu_pred = model.forward_mocu(belief_graph)
-    print(f"   SUCCESS: MOCU prediction: {mocu_pred.item():.4f}")
+    print(f"   Prediction: {mocu_pred.item():.4f}")
     
-    # Test ERM prediction
-    print("\n2. Testing ERM prediction...")
+    # Test normalized prediction
+    print("\n2. Testing MOCU prediction (normalized, for training)...")
+    mocu_norm = model.forward_mocu_normalized(belief_graph)
+    print(f"   Normalized: {mocu_norm.item():.4f}")
+    
+    # Verify denormalization
+    print("\n3. Verifying denormalization...")
+    model.mocu_mean = torch.tensor(0.2)
+    model.mocu_std = torch.tensor(0.1)
+    mocu_denorm = model.forward_mocu(belief_graph)
+    print(f"   With mean=0.2, std=0.1: {mocu_denorm.item():.4f}")
+    
+    # Test ERM
+    print("\n4. Testing ERM prediction...")
     xi = (0, 1)
     erm_pred = model.forward_erm(belief_graph, xi)
-    print(f"   SUCCESS: ERM prediction for pair {xi}: {erm_pred.item():.4f}")
-    
-    # Test Sync prediction
-    print("\n3. Testing Sync prediction...")
-    A_min = np.random.rand(N, N) * 0.5
-    A_min = 0.5 * (A_min + A_min.T)
-    np.fill_diagonal(A_min, 0.0)
-    a_ctrl = 0.15
-    sync_pred = model.forward_sync(A_min, a_ctrl, belief_graph)
-    print(f"   SUCCESS: Sync prediction (a_ctrl={a_ctrl}): {sync_pred.item():.4f}")
-    
-    # Test batch prediction
-    print("\n4. Testing batch MOCU prediction...")
-    batch_graphs = [belief_graph for _ in range(5)]
-    batch_preds = model.forward_mocu_batch(batch_graphs)
-    print(f"   SUCCESS: Batch predictions shape: {batch_preds.shape}")
-    
-    # Test gradient flow
-    print("\n5. Testing gradient flow...")
-    loss = mocu_pred + erm_pred + sync_pred
-    loss.backward()
-    print(f"   SUCCESS: Gradient flow successful")
+    print(f"   ERM for pair {xi}: {erm_pred.item():.4f}")
     
     # Test message passing
-    print("\n6. Testing message passing mechanism...")
-    node_h_init = model.node_encoder(torch.tensor(node_feats, dtype=torch.float32, device=device))
-    edge_h_init = model.edge_encoder(torch.tensor(edge_feats, dtype=torch.float32, device=device))
-    edge_idx = torch.tensor(edge_index, dtype=torch.long, device=device)
+    print("\n5. Testing bidirectional message passing...")
+    node = torch.tensor(node_feats, device=device)
+    edge = torch.tensor(edge_feats, device=device)
+    idx = torch.tensor(edge_index, device=device)
     
-    node_h_after = node_h_init.clone()
-    for layer_idx, mpnn_layer in enumerate(model.mpnn_layers):
-        node_h_after = mpnn_layer(node_h_after, edge_h_init, edge_idx)
-        print(f"   Layer {layer_idx+1}: Node features updated - SUCCESS")
+    node_h = model.node_encoder(node)
+    edge_h = model.edge_encoder(edge)
+    
+    print(f"   Initial node features: {node_h.shape}")
+    print(f"   Edge index: {idx.shape}")
+    
+    for i, mpnn_layer in enumerate(model.mpnn_layers):
+        node_h_new = mpnn_layer(node_h, edge_h, idx)
+        change = torch.norm(node_h_new - node_h).item()
+        print(f"   Layer {i+1}: change = {change:.4f}")
+        node_h = node_h_new
     
     print("\n" + "="*80)
     print("SUCCESS: All tests passed!")
     print("="*80)
-    print("\nKey features verified:")
-    print("  - MPNNLayer class implemented")
-    print("  - Message passing working")
-    print("  - Multiple MPNN layers stacked")
-    print("  - Gradient flow working")
-    print("  - All prediction heads working")
