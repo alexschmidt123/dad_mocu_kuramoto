@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-GPU-Accelerated Data Generation with PyCUDA for Kuramoto Experiment Design
-Generates MOCU + ERM + Sync labels as required for DAD training
+Complete Two-Stage GPU-Accelerated Data Generation
+Stage 1: Surrogate training data (MOCU + Sync only)
+Stage 2: DAD training data (MOCU + ERM + Sync)
+
+Usage: python generate_data.py --config configs/config_fast.yaml
+Generates ALL data (train + val, Stage 1 + Stage 2) automatically
 """
 
 import yaml
@@ -12,13 +16,14 @@ import pickle
 import time
 import sys
 from typing import Dict, List, Tuple
+from pathlib import Path
 
 project_root = os.path.dirname(os.path.abspath(__file__))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
 from core.belief import init_history, update_intervals, pair_threshold, build_belief_graph, History
-from core.pacemaker_control import find_optimal_control_batch, PYCUDA_AVAILABLE
+from core.pacemaker_control import find_optimal_control_batch, PYCUDA_AVAILABLE, sync_check
 from core.bisection import find_min_a_ctrl
 
 try:
@@ -28,22 +33,36 @@ except ImportError:
     TQDM_AVAILABLE = False
     print("WARNING: tqdm not available, progress bars disabled")
 
-# Check PyCUDA availability
+# Check PyCUDA
 if not PYCUDA_AVAILABLE:
     print("="*80)
     print("WARNING: PyCUDA NOT AVAILABLE")
     print("="*80)
-    print("Data generation will use CPU fallback (SLOW)")
+    print("Data generation will use CPU fallback (VERY SLOW)")
     print("Install PyCUDA for GPU acceleration:")
     print("  conda install -c nvidia cuda-toolkit")
     print("  pip install pycuda")
     print("="*80)
+else:
+    print("="*80)
+    print("PyCUDA AVAILABLE - GPU acceleration ENABLED")
+    print("="*80)
 
 
-class GPUBatchDataGenerator:
+class TwoStageDataGenerator:
     """
-    GPU-accelerated batch data generator using PyCUDA.
-    Generates complete datasets with MOCU, ERM, and Sync labels.
+    Two-Stage Data Generator following AccelerateOED 2023 approach.
+    
+    Stage 1: Large dataset for surrogate training
+    - Generates: MOCU + Sync only
+    - Purpose: Train accurate MOCU predictor
+    - Size: Larger (e.g., 2000 train, 400 val)
+    
+    Stage 2: Smaller dataset for DAD training  
+    - Generates: MOCU + ERM + Sync
+    - Purpose: Train adaptive policy
+    - Size: Smaller (e.g., 500 train, 100 val)
+    - Uses Stage 1 data + adds ERM labels
     """
     
     def __init__(self, N: int, K: int, prior_bounds: Tuple[float, float],
@@ -80,7 +99,7 @@ class GPUBatchDataGenerator:
         """
         batch_size = len(h_batch)
         
-        # Step 1: Compute worst-case control a*(A_min) for each belief state
+        # Step 1: Compute worst-case control a*(A_min)
         A_min_batch = np.array([h.lower for h in h_batch]).astype(np.float32)
         for i in range(batch_size):
             np.fill_diagonal(A_min_batch[i], 0.0)
@@ -97,7 +116,6 @@ class GPUBatchDataGenerator:
         # Step 2: Compute expected optimal control E[a*(theta)]
         mocu_values = []
         for i in range(batch_size):
-            # Sample theta from belief
             theta_samples = []
             for _ in range(self.n_theta_samples):
                 A_sample = self.sample_theta_from_belief(h_batch[i], rng)
@@ -156,11 +174,10 @@ class GPUBatchDataGenerator:
             h_posterior = copy.deepcopy(h)
             update_intervals(h_posterior, xi, y_sync, omega)
             
-            # Compute MOCU for posterior (using smaller sample for speed)
+            # Compute MOCU for posterior
             A_min_posterior = h_posterior.lower.copy()
             np.fill_diagonal(A_min_posterior, 0.0)
             
-            from core.pacemaker_control import sync_check
             def check_fn(a_ctrl):
                 try:
                     return sync_check(A_min_posterior, omega, a_ctrl, **self.sim_opts)
@@ -168,7 +185,8 @@ class GPUBatchDataGenerator:
                     return False
             
             try:
-                a_worst = find_min_a_ctrl(A_min_posterior, omega, check_fn, tol=0.005)
+                a_worst = find_min_a_ctrl(A_min_posterior, omega, check_fn, 
+                                         tol=0.005, verbose=False)
             except:
                 a_worst = 2.0
             
@@ -184,7 +202,8 @@ class GPUBatchDataGenerator:
                         return False
                 
                 try:
-                    a_opt = find_min_a_ctrl(A_erm, omega, check_fn_erm, tol=0.005)
+                    a_opt = find_min_a_ctrl(A_erm, omega, check_fn_erm, 
+                                           tol=0.005, verbose=False)
                     theta_samples_erm.append(a_opt)
                 except:
                     theta_samples_erm.append(2.0)
@@ -195,8 +214,11 @@ class GPUBatchDataGenerator:
         
         return max(0.0, np.mean(posterior_mocu_values))
     
-    def generate_sample(self, rng, sample_idx: int, total_samples: int) -> Dict:
-        """Generate one complete sample with all labels"""
+    def generate_stage1_sample(self, rng) -> Dict:
+        """
+        Generate Stage 1 sample (MOCU + Sync only).
+        Stage 1: For surrogate training, no ERM needed.
+        """
         omega = self.generate_omega_batch(1, rng)[0]
         A_true = self.generate_A_batch(1, rng)[0]
         
@@ -217,16 +239,6 @@ class GPUBatchDataGenerator:
             if not candidates:
                 candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)]
             
-            # Compute ERM for subset of candidates
-            erm_scores = {}
-            max_cands = min(10, len(candidates))
-            selected_cands = rng.choice(len(candidates), size=max_cands, replace=False)
-            
-            for cand_idx in selected_cands:
-                xi_cand = candidates[cand_idx]
-                erm = self.compute_erm_for_candidate(h, xi_cand, omega, rng)
-                erm_scores[xi_cand] = erm
-            
             # Random selection for diversity
             xi = candidates[rng.integers(len(candidates))]
             i, j = xi
@@ -237,7 +249,6 @@ class GPUBatchDataGenerator:
                 'belief_graph': belief_graph,
                 'mocu': current_mocu,
                 'candidate_pairs': candidates,
-                'erm_scores': erm_scores,
                 'chosen_pair': xi,
                 'outcome': y_sync,
                 'step': step
@@ -254,7 +265,6 @@ class GPUBatchDataGenerator:
         A_min = h.lower.copy()
         np.fill_diagonal(A_min, 0.0)
         
-        from core.pacemaker_control import sync_check
         def check_fn(a_ctrl):
             try:
                 return sync_check(A_min, omega, a_ctrl, **self.sim_opts)
@@ -262,7 +272,8 @@ class GPUBatchDataGenerator:
                 return False
         
         try:
-            a_ctrl_star = find_min_a_ctrl(A_min, omega, check_fn, tol=0.005)
+            a_ctrl_star = find_min_a_ctrl(A_min, omega, check_fn, 
+                                          tol=0.005, verbose=False)
         except:
             a_ctrl_star = 2.0
         
@@ -283,31 +294,67 @@ class GPUBatchDataGenerator:
             'A_true': A_true,
             'A_min': A_min,
             'a_ctrl_star': a_ctrl_star,
-            'sync_scores': sync_scores
+            'sync_scores': sync_scores,
+            'stage': 1  # Mark as Stage 1 data
         }
     
-    def generate_dataset(self, n_samples: int, seed: int) -> List[Dict]:
-        """Generate complete dataset with progress bar"""
+    def add_erm_to_sample(self, sample: Dict, rng) -> Dict:
+        """
+        Add ERM labels to Stage 1 sample to create Stage 2 sample.
+        This is more efficient than regenerating everything.
+        """
+        omega = sample['omega']
+        A_true = sample['A_true']
+        
+        # Replay experiment sequence and add ERM
+        h = init_history(self.N, self.prior_bounds)
+        
+        for step_idx, step_data in enumerate(sample['experiment_data']):
+            # Compute ERM for candidates at this step
+            candidates = step_data['candidate_pairs']
+            erm_scores = {}
+            
+            max_cands = min(10, len(candidates))
+            selected_cands = rng.choice(len(candidates), size=max_cands, replace=False)
+            
+            for cand_idx in selected_cands:
+                xi_cand = candidates[cand_idx]
+                erm = self.compute_erm_for_candidate(h, xi_cand, omega, rng)
+                erm_scores[xi_cand] = erm
+            
+            # Add ERM to step data
+            step_data['erm_scores'] = erm_scores
+            
+            # Update belief to next step
+            xi = step_data['chosen_pair']
+            y_sync = step_data['outcome']
+            update_intervals(h, xi, y_sync, omega)
+        
+        sample['stage'] = 2  # Mark as Stage 2 data
+        return sample
+    
+    def generate_stage1_dataset(self, n_samples: int, seed: int, 
+                               desc: str = "Stage 1") -> List[Dict]:
+        """Generate Stage 1 dataset (MOCU + Sync only)"""
         rng = np.random.default_rng(seed)
         dataset = []
         
-        print(f"\nGenerating {n_samples} samples...")
-        print(f"  GPU Acceleration: {'ENABLED' if self.use_gpu else 'DISABLED'}")
+        print(f"\n{desc} (MOCU + Sync):")
+        print(f"  Samples: {n_samples}")
         print(f"  MOCU MC samples: {self.n_theta_samples}")
-        print(f"  ERM MC samples: {self.n_erm_samples}")
+        print(f"  GPU: {'ENABLED' if self.use_gpu else 'DISABLED'}")
         
         if TQDM_AVAILABLE:
-            pbar = tqdm(range(n_samples), desc="Generating data", unit="sample",
+            pbar = tqdm(range(n_samples), desc=f"Generating {desc}", unit="sample",
                        bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
             iterator = pbar
         else:
             iterator = range(n_samples)
-            print()
         
         failed = 0
         for i in iterator:
             try:
-                sample = self.generate_sample(rng, i, n_samples)
+                sample = self.generate_stage1_sample(rng)
                 dataset.append(sample)
             except Exception as e:
                 failed += 1
@@ -318,28 +365,74 @@ class GPUBatchDataGenerator:
         if TQDM_AVAILABLE:
             pbar.close()
         
-        print(f"\nGeneration complete: {len(dataset)}/{n_samples} successful (Failed: {failed})")
+        print(f"  Complete: {len(dataset)}/{n_samples} successful (Failed: {failed})")
+        return dataset
+    
+    def generate_stage2_dataset(self, stage1_data: List[Dict], n_samples: int, 
+                               seed: int, desc: str = "Stage 2") -> List[Dict]:
+        """
+        Generate Stage 2 dataset by adding ERM to Stage 1 samples.
+        Takes subset of Stage 1 and adds ERM labels.
+        """
+        rng = np.random.default_rng(seed)
+        
+        # Use subset of Stage 1 data
+        n_use = min(n_samples, len(stage1_data))
+        selected_indices = rng.choice(len(stage1_data), size=n_use, replace=False)
+        
+        print(f"\n{desc} (MOCU + ERM + Sync):")
+        print(f"  Samples: {n_use}")
+        print(f"  ERM MC samples: {self.n_erm_samples}")
+        print(f"  Adding ERM to Stage 1 data...")
+        
+        dataset = []
+        
+        if TQDM_AVAILABLE:
+            pbar = tqdm(selected_indices, desc=f"Adding ERM to {desc}", unit="sample",
+                       bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]')
+            iterator = pbar
+        else:
+            iterator = selected_indices
+        
+        for idx in iterator:
+            try:
+                # Deep copy to avoid modifying original
+                import copy
+                sample = copy.deepcopy(stage1_data[idx])
+                sample_with_erm = self.add_erm_to_sample(sample, rng)
+                dataset.append(sample_with_erm)
+            except Exception as e:
+                continue
+        
+        if TQDM_AVAILABLE:
+            pbar.close()
+        
+        print(f"  Complete: {len(dataset)}/{n_use} successful")
         return dataset
 
 
-def validate_dataset(dataset: List[Dict], split_name: str) -> bool:
+def validate_dataset(dataset: List[Dict], split_name: str, stage: int) -> bool:
     """Validate dataset quality"""
     if not dataset:
-        print(f"ERROR: Empty {split_name} dataset!")
+        print(f"ERROR: Empty {split_name} dataset")
         return False
     
     print(f"\n{'='*80}")
-    print(f"{split_name.upper()} DATASET VALIDATION")
+    print(f"{split_name.upper()} STAGE {stage} VALIDATION")
     print(f"{'='*80}")
     
     all_mocu = []
     all_erm = []
+    all_sync = []
     
     for sample in dataset[:min(50, len(dataset))]:
         for step_data in sample['experiment_data']:
             all_mocu.append(step_data['mocu'])
-            all_erm.extend(list(step_data['erm_scores'].values()))
+            if 'erm_scores' in step_data:
+                all_erm.extend(list(step_data['erm_scores'].values()))
         all_mocu.append(sample['final_mocu'])
+        if 'sync_scores' in sample:
+            all_sync.extend(list(sample['sync_scores'].values()))
     
     all_mocu = np.array(all_mocu)
     
@@ -351,11 +444,15 @@ def validate_dataset(dataset: List[Dict], split_name: str) -> bool:
         print(f"ERM: count={len(all_erm)}, mean={all_erm.mean():.4f}, "
               f"range=[{all_erm.min():.4f}, {all_erm.max():.4f}]")
     
+    if all_sync:
+        all_sync = np.array(all_sync)
+        print(f"Sync: count={len(all_sync)}, mean={all_sync.mean():.2f}")
+    
     issues = []
     if np.any(all_mocu < 0):
-        issues.append("Negative MOCU values detected")
+        issues.append("Negative MOCU values")
     if np.any(np.isnan(all_mocu)) or np.any(np.isinf(all_mocu)):
-        issues.append("NaN or Inf MOCU values detected")
+        issues.append("NaN or Inf MOCU values")
     
     if issues:
         for issue in issues:
@@ -367,10 +464,13 @@ def validate_dataset(dataset: List[Dict], split_name: str) -> bool:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="GPU-Accelerated Data Generation")
+    parser = argparse.ArgumentParser(
+        description="Two-Stage GPU-Accelerated Data Generation",
+        epilog="Usage: python generate_data.py --config configs/config_fast.yaml"
+    )
     parser.add_argument("--config", default="configs/config.yaml")
-    parser.add_argument("--split", choices=["train", "val", "both"], default="both")
-    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force", action="store_true", 
+                       help="Force regenerate (overwrite existing)")
     parser.add_argument("--output-dir", default="dataset")
     
     args = parser.parse_args()
@@ -385,60 +485,116 @@ def main():
     prior_bounds = (cfg["prior_lower"], cfg["prior_upper"])
     omega_range = (cfg["omega"]["low"], cfg["omega"]["high"])
     sim_opts = cfg["sim"]
-    n_train = cfg["surrogate"]["n_train"]
-    n_val = cfg["surrogate"]["n_val"]
+    
+    # Stage 1: Surrogate training data
+    n_train_stage1 = cfg["surrogate"]["n_train"]
+    n_val_stage1 = cfg["surrogate"]["n_val"]
     n_theta_samples = cfg["surrogate"]["n_theta_samples"]
     
-    generator = GPUBatchDataGenerator(
+    # Stage 2: DAD training data
+    n_train_stage2 = cfg["dad_rl"]["n_train"]
+    n_val_stage2 = cfg["dad_rl"]["n_val"]
+    n_erm_samples = cfg["surrogate"].get("n_erm_samples", 10)
+    
+    generator = TwoStageDataGenerator(
         N=N, K=K,
         prior_bounds=prior_bounds,
         omega_range=omega_range,
         sim_opts=sim_opts,
         n_theta_samples=n_theta_samples,
-        n_erm_samples=cfg["surrogate"].get("n_erm_samples", 10)
+        n_erm_samples=n_erm_samples
     )
     
     print("="*80)
-    print("GPU-ACCELERATED DATA GENERATION")
+    print("TWO-STAGE DATA GENERATION")
     print("="*80)
     print(f"Config: {args.config}")
-    print(f"PyCUDA: {'AVAILABLE' if PYCUDA_AVAILABLE else 'NOT AVAILABLE (using CPU)'}")
-    print(f"N={N}, K={K}, train={n_train}, val={n_val}")
+    print(f"PyCUDA: {'AVAILABLE' if PYCUDA_AVAILABLE else 'NOT AVAILABLE (CPU)'}")
+    print(f"N={N}, K={K}")
+    print(f"\nStage 1 (Surrogate): train={n_train_stage1}, val={n_val_stage1}")
+    print(f"Stage 2 (DAD): train={n_train_stage2}, val={n_val_stage2}")
     print("="*80)
     
-    def get_cache_path(split):
-        return os.path.join(args.output_dir, 
-                           f"{split}_N{N}_K{K}_n{n_train if split=='train' else n_val}_"
-                           f"mc{n_theta_samples}_seed{42 if split=='train' else 123}.pkl")
-    
-    # Training data
-    if args.split in ["train", "both"]:
-        train_path = get_cache_path("train")
-        if not args.force and os.path.exists(train_path):
-            print(f"\nTraining data already exists: {train_path}")
+    def get_cache_path(split, stage):
+        if stage == 1:
+            n_samples = n_train_stage1 if split=='train' else n_val_stage1
+            return os.path.join(args.output_dir, 
+                               f"{split}_stage1_N{N}_K{K}_n{n_samples}_"
+                               f"mc{n_theta_samples}_seed{42 if split=='train' else 123}.pkl")
         else:
-            print("\nGenerating TRAINING data...")
-            train_data = generator.generate_dataset(n_train, seed=42)
-            if validate_dataset(train_data, "train"):
-                with open(train_path, 'wb') as f:
-                    pickle.dump(train_data, f)
-                print(f"Saved: {train_path}")
+            n_samples = n_train_stage2 if split=='train' else n_val_stage2
+            return os.path.join(args.output_dir, 
+                               f"{split}_stage2_N{N}_K{K}_n{n_samples}_"
+                               f"mc{n_theta_samples}_erm{n_erm_samples}_seed{42 if split=='train' else 123}.pkl")
     
-    # Validation data
-    if args.split in ["val", "both"]:
-        val_path = get_cache_path("val")
-        if not args.force and os.path.exists(val_path):
-            print(f"\nValidation data already exists: {val_path}")
-        else:
-            print("\nGenerating VALIDATION data...")
-            val_data = generator.generate_dataset(n_val, seed=123)
-            if validate_dataset(val_data, "val"):
-                with open(val_path, 'wb') as f:
-                    pickle.dump(val_data, f)
-                print(f"Saved: {val_path}")
+    # ========== STAGE 1: TRAINING DATA ==========
+    train_stage1_path = get_cache_path("train", 1)
+    if not args.force and os.path.exists(train_stage1_path):
+        print(f"\nStage 1 training data exists: {train_stage1_path}")
+        print("Loading...")
+        with open(train_stage1_path, 'rb') as f:
+            train_stage1_data = pickle.load(f)
+    else:
+        train_stage1_data = generator.generate_stage1_dataset(
+            n_train_stage1, seed=42, desc="Train Stage 1"
+        )
+        if validate_dataset(train_stage1_data, "train", 1):
+            with open(train_stage1_path, 'wb') as f:
+                pickle.dump(train_stage1_data, f)
+            print(f"Saved: {train_stage1_path}")
+    
+    # ========== STAGE 1: VALIDATION DATA ==========
+    val_stage1_path = get_cache_path("val", 1)
+    if not args.force and os.path.exists(val_stage1_path):
+        print(f"\nStage 1 validation data exists: {val_stage1_path}")
+        print("Loading...")
+        with open(val_stage1_path, 'rb') as f:
+            val_stage1_data = pickle.load(f)
+    else:
+        val_stage1_data = generator.generate_stage1_dataset(
+            n_val_stage1, seed=123, desc="Val Stage 1"
+        )
+        if validate_dataset(val_stage1_data, "val", 1):
+            with open(val_stage1_path, 'wb') as f:
+                pickle.dump(val_stage1_data, f)
+            print(f"Saved: {val_stage1_path}")
+    
+    # ========== STAGE 2: TRAINING DATA ==========
+    train_stage2_path = get_cache_path("train", 2)
+    if not args.force and os.path.exists(train_stage2_path):
+        print(f"\nStage 2 training data exists: {train_stage2_path}")
+    else:
+        train_stage2_data = generator.generate_stage2_dataset(
+            train_stage1_data, n_train_stage2, seed=42, desc="Train Stage 2"
+        )
+        if validate_dataset(train_stage2_data, "train", 2):
+            with open(train_stage2_path, 'wb') as f:
+                pickle.dump(train_stage2_data, f)
+            print(f"Saved: {train_stage2_path}")
+    
+    # ========== STAGE 2: VALIDATION DATA ==========
+    val_stage2_path = get_cache_path("val", 2)
+    if not args.force and os.path.exists(val_stage2_path):
+        print(f"\nStage 2 validation data exists: {val_stage2_path}")
+    else:
+        val_stage2_data = generator.generate_stage2_dataset(
+            val_stage1_data, n_val_stage2, seed=123, desc="Val Stage 2"
+        )
+        if validate_dataset(val_stage2_data, "val", 2):
+            with open(val_stage2_path, 'wb') as f:
+                pickle.dump(val_stage2_data, f)
+            print(f"Saved: {val_stage2_path}")
     
     print("\n" + "="*80)
     print("DATA GENERATION COMPLETE")
+    print("="*80)
+    print("\nGenerated files:")
+    print(f"  {train_stage1_path}")
+    print(f"  {val_stage1_path}")
+    print(f"  {train_stage2_path}")
+    print(f"  {val_stage2_path}")
+    print("\nNext step:")
+    print(f"  python train.py --mode dad_with_surrogate --config {args.config}")
     print("="*80)
     return 0
 

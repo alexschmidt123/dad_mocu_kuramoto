@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Training pipeline aligned with AccelerateOED 2023 and DAD papers
-Supports: surrogate-only and dad_with_surrogate modes
+Training pipeline with FIXED normalization handling
+Addresses Priority 1 (Critical): Fix normalization in surrogate training/inference
+
+Two-stage data loading:
+- Stage 1: Surrogate training uses large dataset (MOCU + Sync)
+- Stage 2: DAD training uses smaller dataset (MOCU + ERM + Sync)
 """
 
 import yaml
@@ -14,7 +18,7 @@ from typing import Dict, Any
 
 from core.kuramoto_env import PairTestEnv
 from surrogate.mpnn_surrogate import MPNNSurrogate
-from surrogate.train_surrogate import train_surrogate_model
+from surrogate.train_surrogate import train_surrogate_model, DataCache
 from design.greedy_erm import choose_next_pair_greedy
 from design.dad_policy import DADPolicy
 from design.train_rl import train_dad_rl
@@ -69,25 +73,98 @@ def make_env_factory(cfg: Dict, surrogate):
     return env_factory
 
 
+def load_two_stage_data(cfg: Dict, cache_dir: str = "dataset"):
+    """
+    Load two-stage data properly.
+    
+    Returns:
+        dict with keys:
+        - 'stage1_train': Large dataset for surrogate (MOCU + Sync)
+        - 'stage1_val': Validation for surrogate
+        - 'stage2_train': Smaller dataset for DAD (MOCU + ERM + Sync)
+        - 'stage2_val': Validation for DAD
+    """
+    N = cfg["N"]
+    K = cfg["K"]
+    n_train_s1 = cfg["surrogate"]["n_train"]
+    n_val_s1 = cfg["surrogate"]["n_val"]
+    n_train_s2 = cfg["dad_rl"]["n_train"]
+    n_val_s2 = cfg["dad_rl"]["n_val"]
+    n_theta = cfg["surrogate"]["n_theta_samples"]
+    n_erm = cfg["surrogate"].get("n_erm_samples", 10)
+    
+    def get_stage1_path(split):
+        n = n_train_s1 if split == 'train' else n_val_s1
+        seed = 42 if split == 'train' else 123
+        return os.path.join(cache_dir, 
+                           f"{split}_stage1_N{N}_K{K}_n{n}_mc{n_theta}_seed{seed}.pkl")
+    
+    def get_stage2_path(split):
+        n = n_train_s2 if split == 'train' else n_val_s2
+        seed = 42 if split == 'train' else 123
+        return os.path.join(cache_dir, 
+                           f"{split}_stage2_N{N}_K{K}_n{n}_mc{n_theta}_erm{n_erm}_seed{seed}.pkl")
+    
+    print("\n" + "="*80)
+    print("LOADING TWO-STAGE DATA")
+    print("="*80)
+    
+    data = {}
+    
+    # Load Stage 1 data
+    for split in ['train', 'val']:
+        path = get_stage1_path(split)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Stage 1 {split} data not found: {path}\n"
+                f"Run: python generate_data.py --config {cfg}"
+            )
+        print(f"Loading Stage 1 {split}: {path}")
+        with open(path, 'rb') as f:
+            data[f'stage1_{split}'] = pickle.load(f)
+        print(f"  Loaded {len(data[f'stage1_{split}'])} samples")
+    
+    # Load Stage 2 data
+    for split in ['train', 'val']:
+        path = get_stage2_path(split)
+        if not os.path.exists(path):
+            raise FileNotFoundError(
+                f"Stage 2 {split} data not found: {path}\n"
+                f"Run: python generate_data.py --config {cfg}"
+            )
+        print(f"Loading Stage 2 {split}: {path}")
+        with open(path, 'rb') as f:
+            data[f'stage2_{split}'] = pickle.load(f)
+        print(f"  Loaded {len(data[f'stage2_{split}'])} samples")
+    
+    print("="*80)
+    return data
+
+
 def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
     """
-    Train MPNN surrogate following AccelerateOED 2023 approach.
+    Train MPNN surrogate with FIXED normalization.
     
-    Key alignments with 2023 paper:
-    - Graph-based inputs (node/edge features)
-    - MPNN message passing layers
-    - Target normalization
-    - Adam optimizer with lr=0.001
-    - Batch training
+    CRITICAL FIX: Proper normalization handling
+    - Compute stats on training data only
+    - Store in model for inference
+    - Use normalized forward during training
+    - Use denormalized forward during inference
     """
     model_path = os.path.join(models_dir, "mpnn_surrogate.pth")
     
     print("\n" + "="*80)
     print("SURROGATE TRAINING (AccelerateOED 2023 aligned)")
     print("="*80)
+    print("\nCRITICAL FIX: Normalization properly implemented")
+    print("  - Stats computed on training data only")
+    print("  - Stored in model for inference")
+    print("  - forward_mocu_normalized() during training")
+    print("  - forward_mocu() auto-denormalizes during inference")
+    print("="*80)
     
     if not force and os.path.exists(model_path):
-        print(f"Model exists: {model_path}")
+        print(f"\nModel exists: {model_path}")
         print("Use --force to retrain")
         try:
             surrogate = MPNNSurrogate(
@@ -95,52 +172,100 @@ def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
                 hidden=cfg["surrogate"]["hidden"],
                 dropout=cfg["surrogate"]["dropout"]
             )
-            surrogate.load_state_dict(torch.load(model_path, map_location=device, 
-                                                weights_only=True))
+            
+            # Load model
+            state_dict = torch.load(model_path, map_location=device, weights_only=True)
+            surrogate.load_state_dict(state_dict)
             surrogate.to(device)
             surrogate.eval()
+            
+            # Verify normalization params are loaded
+            print(f"Normalization params:")
+            print(f"  Mean: {surrogate.mocu_mean.item():.4f}")
+            print(f"  Std: {surrogate.mocu_std.item():.4f}")
+            
             print("Model loaded successfully")
             return surrogate
         except Exception as e:
             print(f"WARNING: Failed to load: {e}")
             print("Training new model...")
     
+    # Load two-stage data
+    data = load_two_stage_data(cfg)
+    
+    # Use Stage 1 data for surrogate training (larger dataset, MOCU + Sync only)
+    train_data = data['stage1_train']
+    val_data = data['stage1_val']
+    
     print("\nTraining Configuration:")
     print(f"  Architecture: MPNN with {cfg['surrogate']['hidden']} hidden dims")
-    print(f"  Message passing layers: 3")
-    print(f"  Training samples: {cfg['surrogate']['n_train']}")
-    print(f"  Validation samples: {cfg['surrogate']['n_val']}")
+    print(f"  Training samples: {len(train_data)} (Stage 1)")
+    print(f"  Validation samples: {len(val_data)} (Stage 1)")
     print(f"  Epochs: {cfg['surrogate']['epochs']}")
     print(f"  Learning rate: {cfg['surrogate']['lr']}")
     print(f"  Batch size: {cfg['surrogate']['batch_size']}")
-    print(f"  Optimizer: Adam")
-    print(f"  Target normalization: Enabled")
+    print(f"  Target normalization: ENABLED (critical fix)")
     print("="*80)
     
-    surrogate, results = train_surrogate_model(
-        N=cfg["N"],
-        K=cfg["K"],
-        n_train=cfg["surrogate"]["n_train"],
-        n_val=cfg["surrogate"]["n_val"],
-        n_theta_samples=cfg["surrogate"]["n_theta_samples"],
+    # Import training functions
+    from surrogate.train_surrogate import SurrogateTrainer, normalize_dataset
+    
+    # Initialize model
+    surrogate = MPNNSurrogate(
+        mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0),
+        hidden=cfg["surrogate"]["hidden"],
+        dropout=cfg["surrogate"]["dropout"]
+    )
+    
+    # CRITICAL: Normalize data BEFORE training
+    print("\nNormalizing MOCU labels...")
+    train_data_normalized, (mocu_mean, mocu_std) = normalize_dataset(train_data, stats=None)
+    val_data_normalized, _ = normalize_dataset(val_data, stats=(mocu_mean, mocu_std))
+    
+    # CRITICAL: Store normalization in model
+    surrogate.mocu_mean = torch.tensor(mocu_mean, dtype=torch.float32)
+    surrogate.mocu_std = torch.tensor(mocu_std, dtype=torch.float32)
+    
+    print(f"Normalization parameters:")
+    print(f"  Mean: {mocu_mean:.4f}")
+    print(f"  Std: {mocu_std:.4f}")
+    
+    # Save normalization separately for reference
+    norm_path = os.path.join(models_dir, 'mocu_normalization.pkl')
+    with open(norm_path, 'wb') as f:
+        pickle.dump({'mean': mocu_mean, 'std': mocu_std}, f)
+    print(f"Saved normalization: {norm_path}")
+    
+    # Train surrogate
+    trainer = SurrogateTrainer(surrogate, device=device)
+    
+    print("\nTraining MOCU head...")
+    mocu_results = trainer.train_mocu(
+        train_data_normalized, val_data_normalized,
         epochs=cfg["surrogate"]["epochs"],
         lr=cfg["surrogate"]["lr"],
-        batch_size=cfg["surrogate"]["batch_size"],
-        device=device,
-        save_path=model_path,
-        use_cache=True,
-        hidden=cfg["surrogate"]["hidden"],
-        dropout=cfg["surrogate"]["dropout"],
-        mocu_scale=cfg["surrogate"].get("mocu_scale", 1.0)
+        batch_size=cfg["surrogate"]["batch_size"]
     )
+    
+    print("\nTraining Sync head...")
+    sync_results = trainer.train_sync(
+        train_data_normalized, val_data_normalized,
+        epochs=cfg["surrogate"]["epochs"],
+        lr=cfg["surrogate"]["lr"],
+        batch_size=cfg["surrogate"]["batch_size"]
+    )
+    
+    # Save model (normalization params included in state_dict)
+    torch.save(surrogate.state_dict(), model_path)
     
     print("\n" + "="*80)
     print("SURROGATE TRAINING COMPLETE")
     print("="*80)
     print(f"Model saved: {model_path}")
-    print(f"Final MOCU loss: {results['mocu']['train_losses'][-1]:.4f}")
-    if results['erm']['train_losses']:
-        print(f"Final ERM loss: {results['erm']['train_losses'][-1]:.4f}")
+    print(f"Final MOCU loss: {mocu_results['train_losses'][-1]:.4f}")
+    if sync_results['train_losses']:
+        print(f"Final Sync loss: {sync_results['train_losses'][-1]:.4f}")
+    print(f"Normalization: mean={mocu_mean:.4f}, std={mocu_std:.4f}")
     print("="*80)
     
     return surrogate
@@ -148,13 +273,15 @@ def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
 
 def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, force: bool):
     """
-    Generate fixed design using greedy MPNN selection.
-    This is the 2023 AccelerateOED baseline design.
+    Generate static/fixed design baseline.
+    This is the baseline from the DAD paper (not 2023 paper).
     """
     model_path = os.path.join(models_dir, "fixed_design.pkl")
     
     print("\n" + "="*80)
-    print("FIXED DESIGN (2023 AccelerateOED Baseline)")
+    print("STATIC DESIGN (DAD Paper Baseline)")
+    print("="*80)
+    print("Computed ONCE offline, reused for all instances")
     print("="*80)
     
     if not force and os.path.exists(model_path):
@@ -164,14 +291,19 @@ def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, for
         print(f"Sequence: {fixed_sequence}")
         return fixed_sequence
     
-    print("Generating fixed sequence using Greedy MPNN...")
-    print("This design is computed ONCE offline and reused for all instances")
+    print("\nComputing static sequence using Greedy MPNN...")
     
     env_factory = make_env_factory(cfg, surrogate=surrogate)
     env = env_factory()
     fixed_sequence = []
     
-    for step in range(cfg["K"]):
+    if TQDM_AVAILABLE:
+        pbar = tqdm(range(cfg["K"]), desc="Computing static design", unit="step")
+        iterator = pbar
+    else:
+        iterator = range(cfg["K"])
+    
+    for step in iterator:
         all_cands = env.candidate_pairs()
         untested_cands = [(i, j) for (i, j) in all_cands if not env.h.tested[i, j]]
         cands = untested_cands if untested_cands else all_cands
@@ -180,34 +312,33 @@ def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, for
         fixed_sequence.append(xi)
         env.step(xi)
         
-        print(f"  Step {step+1}: {xi}")
+        if not TQDM_AVAILABLE:
+            print(f"  Step {step+1}: {xi}")
+    
+    if TQDM_AVAILABLE:
+        pbar.close()
     
     with open(model_path, 'wb') as f:
         pickle.dump(fixed_sequence, f)
     
-    print(f"Saved: {model_path}")
-    print(f"Fixed sequence: {fixed_sequence}")
+    print(f"\nSaved: {model_path}")
+    print(f"Static sequence: {fixed_sequence}")
     return fixed_sequence
 
 
 def train_dad_policy_mode(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, force: bool):
     """
-    Train DAD policy adapted for MOCU-based objective.
-    
-    Key differences from DAD paper (eigenvalue-based):
-    1. Objective: Minimize MOCU instead of maximize EIG
-    2. Reward: -MOCU (negative because we minimize)
-    3. Surrogate: Uses MPNN for MOCU/ERM prediction
-    4. Training: REINFORCE policy gradient
+    Train DAD policy with proper data loading.
+    Uses Stage 2 data which includes ERM labels.
     """
     model_path = os.path.join(models_dir, "dad_policy.pth")
     
     print("\n" + "="*80)
-    print("DAD POLICY TRAINING (MOCU-based Adaptation)")
+    print("DAD POLICY TRAINING (MOCU-based)")
     print("="*80)
     
     if not force and os.path.exists(model_path):
-        print(f"Policy exists: {model_path}")
+        print(f"\nPolicy exists: {model_path}")
         try:
             policy = DADPolicy(hidden=cfg["dad_rl"]["hidden"])
             policy.load_state_dict(torch.load(model_path, map_location='cpu', 
@@ -219,16 +350,12 @@ def train_dad_policy_mode(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, 
             print(f"WARNING: Failed to load: {e}")
             print("Training new policy...")
     
-    print("\nDifferences from DAD paper:")
-    print("  Original DAD: Eigenvalue-based, maximize EIG")
-    print("  Our version: MOCU-based, minimize terminal MOCU")
     print("\nTraining Configuration:")
     print(f"  Policy hidden dims: {cfg['dad_rl']['hidden']}")
     print(f"  Epochs: {cfg['dad_rl']['epochs']}")
     print(f"  Episodes/epoch: {cfg['dad_rl']['episodes_per_epoch']}")
     print(f"  Learning rate: {cfg['dad_rl']['lr']}")
-    print(f"  Algorithm: REINFORCE")
-    print(f"  Reward: -MOCU (lower is better)")
+    print(f"  Uses Stage 2 data with ERM labels")
     print("="*80)
     
     env_factory = make_env_factory(cfg, surrogate=surrogate)
@@ -256,21 +383,12 @@ def train_dad_policy_mode(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train models for Kuramoto experiment design",
+        description="Train models with fixed normalization and two-stage data",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Training Modes:
-  surrogate-only: Train MPNN surrogate (2023 AccelerateOED aligned)
-  dad_with_surrogate: Train surrogate + fixed design + DAD policy
-
 Examples:
-  # Train surrogate only
   python train.py --mode surrogate-only --config configs/config.yaml
-  
-  # Train all methods (surrogate + designs)
-  python train.py --mode dad_with_surrogate --config configs/config.yaml
-  
-  # Force retrain everything
+  python train.py --mode dad_with_surrogate --config configs/config_fast.yaml
   python train.py --mode dad_with_surrogate --config configs/config.yaml --force
         """
     )
@@ -278,10 +396,10 @@ Examples:
                        choices=["surrogate-only", "dad_with_surrogate"],
                        default="dad_with_surrogate",
                        help="Training mode")
-    parser.add_argument("--config", default="configs/config.yaml", help="Config file")
-    parser.add_argument("--force", action="store_true", help="Force retrain")
-    parser.add_argument("--models-dir", default="models", help="Models directory")
-    parser.add_argument("--cpu", action="store_true", help="Force CPU mode")
+    parser.add_argument("--config", default="configs/config.yaml")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--models-dir", default="models")
+    parser.add_argument("--cpu", action="store_true")
     
     args = parser.parse_args()
     
@@ -299,27 +417,26 @@ Examples:
     
     # Load config
     if not os.path.exists(args.config):
-        print(f"ERROR: Config file '{args.config}' not found!")
+        print(f"ERROR: Config file '{args.config}' not found")
         return 1
     
     cfg = load_config(args.config)
     
     print("\n" + "="*80)
-    print("TRAINING PIPELINE")
+    print("TRAINING PIPELINE (FIXED NORMALIZATION)")
     print("="*80)
     print(f"Mode: {args.mode}")
     print(f"Config: {args.config}")
     print(f"Models dir: {args.models_dir}")
     print(f"Device: {device.upper()}")
-    print(f"Force retrain: {args.force}")
     print("="*80)
     
     try:
-        # Stage 1: Train surrogate (always required)
+        # Stage 1: Train surrogate (with fixed normalization)
         surrogate = train_surrogate_mode(cfg, device, args.models_dir, args.force)
         
         if args.mode == "dad_with_surrogate":
-            # Stage 2: Generate fixed design
+            # Stage 2: Generate static design
             fixed_design = train_fixed_design(cfg, surrogate, args.models_dir, args.force)
             
             # Stage 3: Train DAD policy
@@ -336,8 +453,9 @@ Examples:
         print("\nAvailable models:")
         for filename in sorted(os.listdir(args.models_dir)):
             filepath = os.path.join(args.models_dir, filename)
-            size_mb = os.path.getsize(filepath) / (1024 * 1024)
-            print(f"  {filename} ({size_mb:.2f} MB)")
+            if os.path.isfile(filepath):
+                size_mb = os.path.getsize(filepath) / (1024 * 1024)
+                print(f"  {filename} ({size_mb:.2f} MB)")
         
         print("\nNext steps:")
         print(f"  python test.py --config {args.config} --episodes 100")

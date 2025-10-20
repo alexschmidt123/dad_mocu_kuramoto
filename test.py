@@ -1,10 +1,7 @@
 #!/usr/bin/env python3
 """
-Comprehensive evaluation of all design strategies:
-1. Random (baseline)
-2. Fixed Design (2023 AccelerateOED)
-3. Greedy MPNN (2023 AccelerateOED)
-4. DAD (MOCU-based adaptation)
+Comprehensive evaluation of all design strategies with progress bars
+Evaluates: Random, Fixed Design, Greedy MPNN, DAD Policy
 """
 
 import yaml
@@ -22,7 +19,6 @@ from surrogate.mpnn_surrogate import MPNNSurrogate
 from design.greedy_erm import choose_next_pair_greedy
 from design.dad_policy import DADPolicy
 from design.train_rl import make_hist_tokens
-from eval.run_eval import run_episode
 from core.bisection import find_min_a_ctrl
 from core.pacemaker_control import sync_check
 
@@ -91,7 +87,7 @@ def dad_chooser_factory(policy: DADPolicy):
     return dad_chooser
 
 
-def run_episode_with_metrics(env, chooser_fn, sim_opts, compute_intermediate=True):
+def run_episode_with_metrics(env, chooser_fn, sim_opts):
     """Run episode and compute comprehensive metrics"""
     start_time = time.time()
     
@@ -136,7 +132,8 @@ def run_episode_with_metrics(env, chooser_fn, sim_opts, compute_intermediate=Tru
             return False
     
     try:
-        a_ctrl_star = find_min_a_ctrl(A_min, env.omega, check_fn, tol=0.005, max_iter=30)
+        a_ctrl_star = find_min_a_ctrl(A_min, env.omega, check_fn, 
+                                      tol=0.005, max_iter=30, verbose=False)
     except:
         a_ctrl_star = 2.0
     
@@ -162,7 +159,7 @@ def run_episode_with_metrics(env, chooser_fn, sim_opts, compute_intermediate=Tru
 
 
 def run_strategy_evaluation(env_factory, chooser_fn, sim_opts, n_episodes, 
-                           strategy_name, verbose=False):
+                           strategy_name):
     """Run evaluation for one strategy with progress bar"""
     results = []
     
@@ -297,7 +294,7 @@ def build_strategies(models: Dict) -> Dict:
     
     # Requires fixed design
     if "fixed_design" in models:
-        strategies["Fixed Design (2023)"] = fixed_design_chooser_factory(
+        strategies["Fixed Design (Static)"] = fixed_design_chooser_factory(
             models["fixed_design"]
         )
     
@@ -375,7 +372,6 @@ def compute_improvements(comparison_results: Dict) -> Dict:
 
 def save_results_json(comparison_results: Dict, filepath: str):
     """Save results to JSON"""
-    # Convert numpy types
     def convert(obj):
         if isinstance(obj, (np.ndarray, np.generic)):
             return obj.tolist()
@@ -422,7 +418,7 @@ def main():
     models = load_models(args.models_dir, cfg, device)
     
     if not models:
-        print("\nERROR: No models found!")
+        print("\nERROR: No models found")
         print("Run: python train.py --mode dad_with_surrogate")
         return 1
     
