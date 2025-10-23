@@ -1,5 +1,4 @@
-# Updated configs/config_fast.yaml
-# Fast Configuration for Quick Testing with Two-Stage Generation
+# Fast config with paper-matched approach but fewer samples
 
 N: 5
 K: 4
@@ -10,60 +9,55 @@ prior_upper: 0.50
 
 omega:
   kind: "uniform"
-  low: -1.0
-  high: 1.0
+  low: -3.0
+  high: 3.0
 
 sim:
-  dt: 0.01
-  T: 3.0              # Reduced from 5.0
-  burn_in: 1.0        # Reduced from 2.0
+  dt: 0.00625   # 1/160
+  T: 3.0
+  burn_in: 1.0
   R_target: 0.95
   method: "RK45"
-  n_trajectories: 2   # Reduced from 3
+  n_trajectories: 2
 
-# MPNN Surrogate parameters (Stage 1 data)
 surrogate:
   hidden: 128
   dropout: 0.1
   mocu_scale: 1.0
   
-  # Stage 1: Smaller dataset for fast testing
-  n_train: 500          # Reduced from 2000
-  n_val: 100            # Reduced from 400
-  n_theta_samples: 10   # Reduced from 30 (BIGGEST SPEEDUP)
+  n_train: 500
+  n_val: 100
+  n_theta_samples: 100   # Reduced from 1000 for speed, but still reasonable
   
-  # Training parameters
-  epochs: 50            # Reduced from 100
+  epochs: 50
   lr: 0.001
   batch_size: 512
   
-  # Stage 2: ERM computation parameters
-  n_erm_samples: 5      # Reduced from 10
-  max_erm_candidates: 8 # Reduced from 10
+  n_erm_samples: 5
+  max_erm_candidates: 8
 
-# DAD Policy parameters (Stage 2 data)
 dad_rl:
   hidden: 128
-  epochs: 20            # Reduced
+  epochs: 20
   episodes_per_epoch: 30
   lr: 0.0003
   
-  # Stage 2: Even smaller dataset for fast testing
-  n_train: 100          # Small for testing
-  n_val: 20             # Small for testing
+  n_train: 100
+  n_val: 20
 
 enable_dad: true
 
 advanced:
   bisection:
-    tol: 0.002        # Relaxed from 0.001
-    max_expand: 15    # Reduced from 20
-    max_iter: 30      # Reduced from 40
+    tol: 0.002
+    max_expand: 15
+    max_iter: 30
     verbose: false
   data_gen:
     parallel: false
     cache_labels: true
-    two_stage: true    # Enable two-stage generation
+    two_stage: true
+    use_adaptive_bounds: true
   eval:
     save_trajectories: false
     compute_diagnostics: true

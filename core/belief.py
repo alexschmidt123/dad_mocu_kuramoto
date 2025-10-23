@@ -9,13 +9,30 @@ class History:
     upper: np.ndarray    # (N,N) symmetric upper bounds
     tested: np.ndarray   # (N,N) bool mask for tested edges
 
-def init_history(N: int, prior_bounds: tuple[float, float]) -> History:
-    lo, hi = prior_bounds
-    lower = np.zeros((N, N)); upper = np.zeros((N, N)); tested = np.zeros((N, N), dtype=bool)
-    for i in range(N):
-        for j in range(N):
-            if i == j: continue
-            lower[i, j] = lo; upper[i, j] = hi
+def init_history(N: int, prior_bounds) -> History:
+    """
+    Initialize history with either:
+    - Tuple (lo, hi): uniform bounds
+    - Tuple (lower_matrix, upper_matrix): adaptive bounds
+    """
+    lower = np.zeros((N, N))
+    upper = np.zeros((N, N))
+    tested = np.zeros((N, N), dtype=bool)
+    
+    if isinstance(prior_bounds, tuple) and len(prior_bounds) == 2:
+        if isinstance(prior_bounds[0], (int, float)):
+            # Uniform bounds
+            lo, hi = prior_bounds
+            for i in range(N):
+                for j in range(N):
+                    if i == j: continue
+                    lower[i, j] = lo
+                    upper[i, j] = hi
+        else:
+            # Matrix bounds (adaptive)
+            lower = prior_bounds[0].copy()
+            upper = prior_bounds[1].copy()
+    
     return History(pairs=[], outcomes=[], lower=lower, upper=upper, tested=tested)
 
 def pair_threshold(omega: np.ndarray, i: int, j: int) -> float:

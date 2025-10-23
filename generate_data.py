@@ -92,55 +92,75 @@ class TwoStageDataGenerator:
         return A_batch
     
     def compute_mocu_batch_gpu(self, h_batch: List[History], omega_batch: np.ndarray, 
-                               rng) -> np.ndarray:
+                            rng) -> np.ndarray:
         """
-        Compute MOCU for a batch of belief states using GPU acceleration.
-        MOCU = a*(A_min) - E[a*(theta)]
+        Compute MOCU for a batch using paper's sampling approach.
+        
+        For each belief state:
+        1. Sample n_theta_samples coupling matrices
+        2. Find optimal control for each sample
+        3. Compute MOCU = max(a_optimal) - mean(a_optimal)
         """
         batch_size = len(h_batch)
-        
-        # Step 1: Compute worst-case control a*(A_min)
-        A_min_batch = np.array([h.lower for h in h_batch]).astype(np.float32)
-        for i in range(batch_size):
-            np.fill_diagonal(A_min_batch[i], 0.0)
-        
-        if self.use_gpu:
-            a_worst_batch = find_optimal_control_batch(
-                A_min_batch, omega_batch, self.sim_opts, use_gpu=True, tol=0.005
-            )
-        else:
-            a_worst_batch = find_optimal_control_batch(
-                A_min_batch, omega_batch, self.sim_opts, use_gpu=False, tol=0.005
-            )
-        
-        # Step 2: Compute expected optimal control E[a*(theta)]
         mocu_values = []
+        
         for i in range(batch_size):
+            h = h_batch[i]
+            omega = omega_batch[i]
+            
+            # Sample coupling matrices from belief
             theta_samples = []
             for _ in range(self.n_theta_samples):
-                A_sample = self.sample_theta_from_belief(h_batch[i], rng)
+                A_sample = self.sample_theta_from_belief(h, rng)
                 theta_samples.append(A_sample)
             
+            # Compute optimal controls
             theta_batch = np.array(theta_samples).astype(np.float32)
-            omega_repeated = np.tile(omega_batch[i:i+1], (self.n_theta_samples, 1, 1))
+            omega_repeated = np.tile(omega, (self.n_theta_samples, 1)).astype(np.float32)
             
+            # Use GPU if available and batch is large enough
             if self.use_gpu and self.n_theta_samples >= 10:
-                a_optimal_batch = find_optimal_control_batch(
-                    theta_batch, omega_repeated.squeeze(1), 
-                    self.sim_opts, use_gpu=True, tol=0.005
-                )
+                try:
+                    a_optimal_batch = find_optimal_control_batch(
+                        theta_batch, omega_repeated, 
+                        self.sim_opts, use_gpu=True, tol=0.005
+                    )
+                except:
+                    # Fallback to CPU
+                    a_optimal_batch = find_optimal_control_batch(
+                        theta_batch, omega_repeated,
+                        self.sim_opts, use_gpu=False, tol=0.005
+                    )
             else:
                 a_optimal_batch = find_optimal_control_batch(
-                    theta_batch, omega_repeated.squeeze(1),
+                    theta_batch, omega_repeated,
                     self.sim_opts, use_gpu=False, tol=0.005
                 )
             
-            expected_optimal = np.mean(a_optimal_batch)
-            mocu = max(0.0, min(5.0, a_worst_batch[i] - expected_optimal))
+            # Compute MOCU using paper's formula
+            K_max = self.n_theta_samples
+            a_save = a_optimal_batch
+            
+            if K_max >= 1000:
+                temp = np.sort(a_save)
+                ll = int(K_max * 0.005)
+                uu = int(K_max * 0.995)
+                a_save_trimmed = temp[ll:uu]
+                
+                if len(a_save_trimmed) > 0:
+                    a_star = np.max(a_save_trimmed)
+                    mocu = np.sum(a_star - a_save_trimmed) / (K_max * 0.99)
+                else:
+                    mocu = 0.1
+            else:
+                a_star = np.max(a_save)
+                mocu = np.sum(a_star - a_save) / K_max
+            
+            mocu = max(0.0, min(5.0, mocu))
             mocu_values.append(mocu)
         
         return np.array(mocu_values)
-    
+
     def sample_theta_from_belief(self, h: History, rng) -> np.ndarray:
         """Sample coupling matrix from current belief intervals"""
         A = np.zeros((self.N, self.N))
@@ -215,23 +235,37 @@ class TwoStageDataGenerator:
         return max(0.0, np.mean(posterior_mocu_values))
     
     def generate_stage1_sample(self, rng) -> Dict:
-        """
-        Generate Stage 1 sample (MOCU + Sync only).
-        Stage 1: For surrogate training, no ERM needed.
-        """
+        """Generate Stage 1 sample with adaptive bounds"""
         omega = self.generate_omega_batch(1, rng)[0]
-        A_true = self.generate_A_batch(1, rng)[0]
         
-        h = init_history(self.N, self.prior_bounds)
+        # CRITICAL: Use adaptive bounds instead of fixed prior_bounds
+        aLower, aUpper = self.compute_adaptive_bounds(omega)
+        
+        # Sample true A within these adaptive bounds
+        A_true = np.zeros((self.N, self.N))
+        for i in range(self.N):
+            for j in range(i+1, self.N):
+                A_true[i, j] = rng.uniform(aLower[i, j], aUpper[i, j])
+                A_true[j, i] = A_true[i, j]
+        
+        # Initialize history with adaptive bounds
+        h = History(
+            pairs=[],
+            outcomes=[],
+            lower=aLower.copy(),
+            upper=aUpper.copy(),
+            tested=np.zeros((self.N, self.N), dtype=bool)
+        )
+        
+        # Rest of the method continues as before...
         experiment_data = []
         
         for step in range(self.K):
             belief_graph = build_belief_graph(h, omega)
             
-            # Compute current MOCU
+            # Compute current MOCU with corrected formula
             current_mocu_array = self.compute_mocu_batch_gpu([h], omega[np.newaxis, :], rng)
             current_mocu = float(current_mocu_array[0])
-            
             # Get candidate pairs
             candidates = [(i, j) for i in range(self.N) for j in range(i+1, self.N)
                          if not h.tested[i, j]]
@@ -298,6 +332,44 @@ class TwoStageDataGenerator:
             'stage': 1  # Mark as Stage 1 data
         }
     
+    def compute_adaptive_bounds(self, omega: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Compute adaptive prior bounds based on frequency differences.
+        This matches the paper's approach in runMainForPerformanceMeasure.py
+        """
+        N = len(omega)
+        aUpper = np.zeros((N, N))
+        aLower = np.zeros((N, N))
+        
+        for i in range(N):
+            for j in range(i + 1, N):
+                syncThreshold = 0.5 * np.abs(omega[i] - omega[j])
+                aUpper[i, j] = syncThreshold * 1.15
+                aLower[i, j] = syncThreshold * 0.85
+                aUpper[j, i] = aUpper[i, j]
+                aLower[j, i] = aLower[i, j]
+        
+        # Paper applies additional scaling to certain pairs
+        # For N=5 system (indices 0-4):
+        if N == 5:
+            # Scale down coupling for certain pairs
+            # This creates heterogeneous coupling structure
+            for i in [0]:
+                for j in range(2, 5):
+                    aUpper[i, j] *= 0.3
+                    aLower[i, j] *= 0.3
+                    aUpper[j, i] = aUpper[i, j]
+                    aLower[j, i] = aLower[i, j]
+            
+            for i in [1]:
+                for j in range(3, 5):
+                    aUpper[i, j] *= 0.45
+                    aLower[i, j] *= 0.45
+                    aUpper[j, i] = aUpper[i, j]
+                    aLower[j, i] = aLower[i, j]
+        
+        return aLower, aUpper
+
     def add_erm_to_sample(self, sample: Dict, rng) -> Dict:
         """
         Add ERM labels to Stage 1 sample to create Stage 2 sample.
@@ -461,6 +533,7 @@ def validate_dataset(dataset: List[Dict], split_name: str, stage: int) -> bool:
     
     print("SUCCESS: Validation passed")
     return True
+
 
 
 def main():

@@ -73,6 +73,57 @@ def fixed_design_chooser_factory(fixed_sequence):
     
     return fixed_chooser
 
+def make_env_factory(cfg: Dict, surrogate, episode_counter=[0]):
+    """Create environment factory with unique seeds per episode"""
+    def env_factory():
+        N, K = cfg["N"], cfg["K"]
+        episode_seed = cfg["seed"] + episode_counter[0]
+        episode_counter[0] += 1
+        rng = np.random.default_rng(episode_seed)
+        
+        # Match paper's omega range
+        if cfg["omega"]["kind"] == "uniform":
+            omega = rng.uniform(cfg["omega"]["low"], cfg["omega"]["high"], size=N)
+        else:
+            omega = rng.normal(0.0, 1.0, size=N)
+        
+        # CRITICAL: Use adaptive bounds
+        aLower, aUpper = compute_adaptive_bounds_for_env(omega, N)
+        prior = (aLower, aUpper)  # Now returns matrices
+        
+        return PairTestEnv(N=N, omega=omega, prior_bounds=prior, K=K, 
+                          surrogate=surrogate, rng=rng)
+    return env_factory
+
+def compute_adaptive_bounds_for_env(omega, N):
+    """Helper to compute adaptive bounds for env"""
+    aUpper = np.zeros((N, N))
+    aLower = np.zeros((N, N))
+    
+    for i in range(N):
+        for j in range(i + 1, N):
+            syncThreshold = 0.5 * np.abs(omega[i] - omega[j])
+            aUpper[i, j] = syncThreshold * 1.15
+            aLower[i, j] = syncThreshold * 0.85
+            aUpper[j, i] = aUpper[i, j]
+            aLower[j, i] = aLower[i, j]
+    
+    if N == 5:
+        for i in [0]:
+            for j in range(2, 5):
+                aUpper[i, j] *= 0.3
+                aLower[i, j] *= 0.3
+                aUpper[j, i] = aUpper[i, j]
+                aLower[j, i] = aLower[i, j]
+        
+        for i in [1]:
+            for j in range(3, 5):
+                aUpper[i, j] *= 0.45
+                aLower[i, j] *= 0.45
+                aUpper[j, i] = aUpper[i, j]
+                aLower[j, i] = aLower[i, j]
+    
+    return aLower, aUpper
 
 def greedy_chooser(env, cands):
     """Greedy MPNN chooser (2023 AccelerateOED)"""

@@ -76,23 +76,47 @@ class SyntheticDataGenerator:
             return 2.0
     
     def compute_mocu(self, h: History, omega: np.ndarray, rng: np.random.Generator) -> float:
-        """Compute MOCU = a*(A_min) - E[a*(theta)]"""
+        """
+        Compute MOCU using paper's approach: sampling-based estimation.
+        
+        Paper formula: MOCU = a_IBR - E[a*(θ)]
+        where a_IBR is the max of sampled a*(θ) values (worst-case)
+        and E[a*(θ)] is the mean of sampled values
+        
+        This matches the MOCU.py implementation from the 2023 paper.
+        """
+        K_max = self.n_theta_samples
+        a_save = np.zeros(K_max)
+        
         try:
-            # Worst-case control
-            A_min = h.lower.copy()
-            np.fill_diagonal(A_min, 0.0)
-            a_worst_case = self.find_optimal_control(A_min, omega)
-            
-            # Expected optimal control
-            optimal_controls = []
-            for _ in range(self.n_theta_samples):
+            # Sample K_max coupling matrices from current belief
+            for k in range(K_max):
                 A_sample = self.sample_theta_from_belief(h, rng)
                 a_optimal = self.find_optimal_control(A_sample, omega)
-                optimal_controls.append(a_optimal)
+                a_save[k] = a_optimal
             
-            expected_optimal = np.mean(optimal_controls) if optimal_controls else a_worst_case
-            return max(0.0, min(5.0, a_worst_case - expected_optimal))
-        except:
+            # Compute MOCU using paper's formula
+            if K_max >= 1000:
+                # For large samples, remove outliers (top/bottom 0.5%)
+                temp = np.sort(a_save)
+                ll = int(K_max * 0.005)
+                uu = int(K_max * 0.995)
+                a_save_trimmed = temp[ll:uu]  # Remove outliers
+                
+                if len(a_save_trimmed) == 0:
+                    return 0.1
+                
+                a_star = np.max(a_save_trimmed)  # a_IBR (worst-case)
+                MOCU_val = np.sum(a_star - a_save_trimmed) / (K_max * 0.99)
+            else:
+                # For small samples, use all
+                a_star = np.max(a_save)
+                MOCU_val = np.sum(a_star - a_save) / K_max
+            
+            return max(0.0, min(5.0, MOCU_val))
+        
+        except Exception as e:
+            print(f"Warning in compute_mocu: {e}")
             return 0.1
     
     def compute_erm(self, h: History, xi: Tuple[int, int], omega: np.ndarray, 

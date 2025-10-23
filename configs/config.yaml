@@ -1,20 +1,21 @@
-# Updated configs/config.yaml
-# RTX 4090 Optimized Configuration with Two-Stage Data Generation
+# Updated configs/config.yaml with paper-matched parameters
 
-N: 5                    # Number of oscillators
-K: 4                    # Number of experiments
+N: 5
+K: 4
 seed: 42
 
+# Use adaptive bounds like the paper (will be computed per instance)
+# These are fallback values only
 prior_lower: 0.05
 prior_upper: 0.50
 
 omega:
   kind: "uniform"
-  low: -1.0
-  high: 1.0
+  low: -3.0    # Increased range to match paper
+  high: 3.0
 
 sim:
-  dt: 0.01
+  dt: 0.00625   # 1/160 to match paper exactly
   T: 5.0
   burn_in: 2.0
   R_target: 0.95
@@ -27,19 +28,19 @@ surrogate:
   dropout: 0.1
   mocu_scale: 1.0
   
-  # Stage 1: Large dataset for surrogate training (MOCU only)
-  n_train: 2000          # Surrogate training samples
-  n_val: 400             # Surrogate validation samples
-  n_theta_samples: 30    # MC samples for MOCU computation
+  # CRITICAL: Increased MC samples to match paper's approach
+  n_train: 2000
+  n_val: 400
+  n_theta_samples: 1000    # Increased from 30 to 1000 (paper uses 20480 but 1000 is reasonable)
   
   # Training parameters
   epochs: 100
   lr: 0.001
   batch_size: 512
   
-  # Stage 2: ERM computation parameters (for DAD data)
-  n_erm_samples: 10      # MC samples for ERM computation
-  max_erm_candidates: 10 # Max candidates to compute ERM for
+  # Stage 2: ERM computation parameters
+  n_erm_samples: 10
+  max_erm_candidates: 10
 
 # DAD Policy parameters (Stage 2 data)
 dad_rl:
@@ -48,9 +49,8 @@ dad_rl:
   episodes_per_epoch: 50
   lr: 0.0002
   
-  # Stage 2: Smaller dataset for DAD training (MOCU + ERM)
-  n_train: 500           # DAD training samples (1/4 of surrogate)
-  n_val: 100             # DAD validation samples (1/4 of surrogate)
+  n_train: 500
+  n_val: 100
 
 enable_dad: true
 
@@ -63,7 +63,8 @@ advanced:
   data_gen:
     parallel: false
     cache_labels: true
-    two_stage: true        # Enable two-stage generation
+    two_stage: true
+    use_adaptive_bounds: true  # NEW: Enable adaptive bounds like paper
   eval:
     save_trajectories: false
     compute_diagnostics: true
