@@ -27,7 +27,7 @@ surrogate:
   
   n_train: 500
   n_val: 100
-  n_theta_samples: 100   # Reduced from 1000 for speed, but still reasonable
+  n_theta_samples: 500   # Reduced from 1000 for speed, but still reasonable
   
   epochs: 50
   lr: 0.001
