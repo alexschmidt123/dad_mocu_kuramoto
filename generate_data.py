@@ -334,13 +334,13 @@ class TwoStageDataGenerator:
     
     def compute_adaptive_bounds(self, omega: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Compute adaptive prior bounds based on frequency differences.
-        This matches the paper's approach in runMainForPerformanceMeasure.py
+        Compute adaptive prior bounds exactly matching paper2023's runMainForPerformanceMeasure.py
         """
         N = len(omega)
         aUpper = np.zeros((N, N))
         aLower = np.zeros((N, N))
         
+        # Step 1: Basic bounds based on synchronization threshold
         for i in range(N):
             for j in range(i + 1, N):
                 syncThreshold = 0.5 * np.abs(omega[i] - omega[j])
@@ -349,22 +349,24 @@ class TwoStageDataGenerator:
                 aUpper[j, i] = aUpper[i, j]
                 aLower[j, i] = aLower[i, j]
         
-        # Paper applies additional scaling to certain pairs
-        # For N=5 system (indices 0-4):
+        # Step 2: Paper2023's heterogeneous structure for N=5
         if N == 5:
-            # Scale down coupling for certain pairs
-            # This creates heterogeneous coupling structure
+            # Weaker coupling for pairs (0,2), (0,3), (0,4)
+            aUpper[0, 2:5] = aUpper[0, 2:5] * 0.3
+            aLower[0, 2:5] = aLower[0, 2:5] * 0.3
+            
+            # Medium coupling for pairs (1,3), (1,4)  
+            aUpper[1, 3:5] = aUpper[1, 3:5] * 0.45
+            aLower[1, 3:5] = aLower[1, 3:5] * 0.45
+            
+            # Make symmetric
             for i in [0]:
                 for j in range(2, 5):
-                    aUpper[i, j] *= 0.3
-                    aLower[i, j] *= 0.3
                     aUpper[j, i] = aUpper[i, j]
                     aLower[j, i] = aLower[i, j]
             
             for i in [1]:
                 for j in range(3, 5):
-                    aUpper[i, j] *= 0.45
-                    aLower[i, j] *= 0.45
                     aUpper[j, i] = aUpper[i, j]
                     aLower[j, i] = aLower[i, j]
         
