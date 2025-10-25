@@ -1,11 +1,7 @@
 #!/usr/bin/env python3
 """
-Training pipeline with FIXED normalization handling
-Addresses Priority 1 (Critical): Fix normalization in surrogate training/inference
-
-Two-stage data loading:
-- Stage 1: Surrogate training uses large dataset (MOCU + Sync)
-- Stage 2: DAD training uses smaller dataset (MOCU + ERM + Sync)
+CORRECTED train.py with adaptive bounds matching paper 2023
+CRITICAL FIX: Now uses adaptive bounds based on natural frequencies
 """
 
 import yaml
@@ -28,6 +24,52 @@ try:
     TQDM_AVAILABLE = True
 except ImportError:
     TQDM_AVAILABLE = False
+
+
+def compute_adaptive_bounds(omega: np.ndarray, N: int):
+    """
+    Compute adaptive prior bounds based on frequency differences.
+    Matches AccelerateOED 2023 paper's approach.
+    
+    This is CRITICAL for paper replication:
+    - Bounds depend on |�_i - �_j| for each pair
+    - Creates heterogeneous network structure for N=5
+    """
+    aUpper = np.zeros((N, N))
+    aLower = np.zeros((N, N))
+    
+    for i in range(N):
+        for j in range(i + 1, N):
+            # Synchronization threshold based on frequency difference
+            syncThreshold = 0.5 * np.abs(omega[i] - omega[j])
+            
+            # Prior bounds: �15% around sync threshold
+            aUpper[i, j] = syncThreshold * 1.15
+            aLower[i, j] = syncThreshold * 0.85
+            
+            # Make symmetric
+            aUpper[j, i] = aUpper[i, j]
+            aLower[j, i] = aLower[i, j]
+    
+    # Paper's heterogeneous coupling structure for N=5
+    if N == 5:
+        # Weaker coupling for pairs (0,2), (0,3), (0,4)
+        for i in [0]:
+            for j in range(2, 5):
+                aUpper[i, j] *= 0.3
+                aLower[i, j] *= 0.3
+                aUpper[j, i] = aUpper[i, j]
+                aLower[j, i] = aLower[i, j]
+        
+        # Medium coupling for pairs (1,3), (1,4)
+        for i in [1]:
+            for j in range(3, 5):
+                aUpper[i, j] *= 0.45
+                aLower[i, j] *= 0.45
+                aUpper[j, i] = aUpper[i, j]
+                aLower[j, i] = aLower[i, j]
+    
+    return aLower, aUpper
 
 
 def setup_gpu():
@@ -57,17 +99,26 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def make_env_factory(cfg: Dict, surrogate):
-    """Create environment factory"""
+    """
+    Create environment factory with adaptive bounds (PAPER 2023).
+    
+    CRITICAL FIX: This now uses adaptive bounds based on omega,
+    matching the paper's approach and data generation.
+    """
     def env_factory():
         N, K = cfg["N"], cfg["K"]
         rng = np.random.default_rng(cfg["seed"])
         
+        # Generate natural frequencies
         if cfg["omega"]["kind"] == "uniform":
             omega = rng.uniform(cfg["omega"]["low"], cfg["omega"]["high"], size=N)
         else:
             omega = rng.normal(0.0, 1.0, size=N)
         
-        prior = (cfg["prior_lower"], cfg["prior_upper"])
+        #  FIXED: Use adaptive bounds based on omega (paper 2023)
+        aLower, aUpper = compute_adaptive_bounds(omega, N)
+        prior = (aLower, aUpper)  # Pass matrices, not scalars
+        
         return PairTestEnv(N=N, omega=omega, prior_bounds=prior, K=K, 
                           surrogate=surrogate, rng=rng)
     return env_factory
@@ -142,25 +193,11 @@ def load_two_stage_data(cfg: Dict, cache_dir: str = "dataset"):
 
 
 def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
-    """
-    Train MPNN surrogate with FIXED normalization.
-    
-    CRITICAL FIX: Proper normalization handling
-    - Compute stats on training data only
-    - Store in model for inference
-    - Use normalized forward during training
-    - Use denormalized forward during inference
-    """
+    """Train MPNN surrogate with proper normalization"""
     model_path = os.path.join(models_dir, "mpnn_surrogate.pth")
     
     print("\n" + "="*80)
     print("SURROGATE TRAINING (AccelerateOED 2023 aligned)")
-    print("="*80)
-    print("\nCRITICAL FIX: Normalization properly implemented")
-    print("  - Stats computed on training data only")
-    print("  - Stored in model for inference")
-    print("  - forward_mocu_normalized() during training")
-    print("  - forward_mocu() auto-denormalizes during inference")
     print("="*80)
     
     if not force and os.path.exists(model_path):
@@ -173,13 +210,11 @@ def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
                 dropout=cfg["surrogate"]["dropout"]
             )
             
-            # Load model
             state_dict = torch.load(model_path, map_location=device, weights_only=True)
             surrogate.load_state_dict(state_dict)
             surrogate.to(device)
             surrogate.eval()
             
-            # Verify normalization params are loaded
             print(f"Normalization params:")
             print(f"  Mean: {surrogate.mocu_mean.item():.4f}")
             print(f"  Std: {surrogate.mocu_std.item():.4f}")
@@ -193,7 +228,7 @@ def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
     # Load two-stage data
     data = load_two_stage_data(cfg)
     
-    # Use Stage 1 data for surrogate training (larger dataset, MOCU + Sync only)
+    # Use Stage 1 data for surrogate training
     train_data = data['stage1_train']
     val_data = data['stage1_val']
     
@@ -204,10 +239,8 @@ def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
     print(f"  Epochs: {cfg['surrogate']['epochs']}")
     print(f"  Learning rate: {cfg['surrogate']['lr']}")
     print(f"  Batch size: {cfg['surrogate']['batch_size']}")
-    print(f"  Target normalization: ENABLED (critical fix)")
     print("="*80)
     
-    # Import training functions
     from surrogate.train_surrogate import SurrogateTrainer, normalize_dataset
     
     # Initialize model
@@ -217,24 +250,16 @@ def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
         dropout=cfg["surrogate"]["dropout"]
     )
     
-    # CRITICAL: Normalize data BEFORE training
+    # Normalize data
     print("\nNormalizing MOCU labels...")
     train_data_normalized, (mocu_mean, mocu_std) = normalize_dataset(train_data, stats=None)
     val_data_normalized, _ = normalize_dataset(val_data, stats=(mocu_mean, mocu_std))
     
-    # CRITICAL: Store normalization in model
+    # Store normalization in model
     surrogate.mocu_mean = torch.tensor(mocu_mean, dtype=torch.float32)
     surrogate.mocu_std = torch.tensor(mocu_std, dtype=torch.float32)
     
-    print(f"Normalization parameters:")
-    print(f"  Mean: {mocu_mean:.4f}")
-    print(f"  Std: {mocu_std:.4f}")
-    
-    # Save normalization separately for reference
-    norm_path = os.path.join(models_dir, 'mocu_normalization.pkl')
-    with open(norm_path, 'wb') as f:
-        pickle.dump({'mean': mocu_mean, 'std': mocu_std}, f)
-    print(f"Saved normalization: {norm_path}")
+    print(f"Normalization: mean={mocu_mean:.4f}, std={mocu_std:.4f}")
     
     # Train surrogate
     trainer = SurrogateTrainer(surrogate, device=device)
@@ -255,7 +280,7 @@ def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
         batch_size=cfg["surrogate"]["batch_size"]
     )
     
-    # Save model (normalization params included in state_dict)
+    # Save model
     torch.save(surrogate.state_dict(), model_path)
     
     print("\n" + "="*80)
@@ -265,23 +290,17 @@ def train_surrogate_mode(cfg: Dict, device: str, models_dir: str, force: bool):
     print(f"Final MOCU loss: {mocu_results['train_losses'][-1]:.4f}")
     if sync_results['train_losses']:
         print(f"Final Sync loss: {sync_results['train_losses'][-1]:.4f}")
-    print(f"Normalization: mean={mocu_mean:.4f}, std={mocu_std:.4f}")
     print("="*80)
     
     return surrogate
 
 
 def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, force: bool):
-    """
-    Generate static/fixed design baseline.
-    This is the baseline from the DAD paper (not 2023 paper).
-    """
+    """Generate static/fixed design baseline"""
     model_path = os.path.join(models_dir, "fixed_design.pkl")
     
     print("\n" + "="*80)
     print("STATIC DESIGN (DAD Paper Baseline)")
-    print("="*80)
-    print("Computed ONCE offline, reused for all instances")
     print("="*80)
     
     if not force and os.path.exists(model_path):
@@ -327,10 +346,7 @@ def train_fixed_design(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, for
 
 
 def train_dad_policy_mode(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, force: bool):
-    """
-    Train DAD policy with proper data loading.
-    Uses Stage 2 data which includes ERM labels.
-    """
+    """Train DAD policy"""
     model_path = os.path.join(models_dir, "dad_policy.pth")
     
     print("\n" + "="*80)
@@ -355,7 +371,6 @@ def train_dad_policy_mode(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, 
     print(f"  Epochs: {cfg['dad_rl']['epochs']}")
     print(f"  Episodes/epoch: {cfg['dad_rl']['episodes_per_epoch']}")
     print(f"  Learning rate: {cfg['dad_rl']['lr']}")
-    print(f"  Uses Stage 2 data with ERM labels")
     print("="*80)
     
     env_factory = make_env_factory(cfg, surrogate=surrogate)
@@ -383,19 +398,17 @@ def train_dad_policy_mode(cfg: Dict, surrogate: MPNNSurrogate, models_dir: str, 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Train models with fixed normalization and two-stage data",
+        description="CORRECTED training with adaptive bounds (paper 2023)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python train.py --mode surrogate-only --config configs/config.yaml
   python train.py --mode dad_with_surrogate --config configs/config_fast.yaml
-  python train.py --mode dad_with_surrogate --config configs/config.yaml --force
         """
     )
     parser.add_argument("--mode", 
                        choices=["surrogate-only", "dad_with_surrogate"],
-                       default="dad_with_surrogate",
-                       help="Training mode")
+                       default="dad_with_surrogate")
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--models-dir", default="models")
@@ -423,40 +436,32 @@ Examples:
     cfg = load_config(args.config)
     
     print("\n" + "="*80)
-    print("TRAINING PIPELINE (FIXED NORMALIZATION)")
+    print("CORRECTED TRAINING PIPELINE (Paper 2023)")
     print("="*80)
     print(f"Mode: {args.mode}")
     print(f"Config: {args.config}")
     print(f"Models dir: {args.models_dir}")
     print(f"Device: {device.upper()}")
+    print(f"CRITICAL FIX: Adaptive bounds enabled ")
     print("="*80)
     
     try:
-        # Stage 1: Train surrogate (with fixed normalization)
+        # Train surrogate
         surrogate = train_surrogate_mode(cfg, device, args.models_dir, args.force)
         
         if args.mode == "dad_with_surrogate":
-            # Stage 2: Generate static design
+            # Generate static design
             fixed_design = train_fixed_design(cfg, surrogate, args.models_dir, args.force)
             
-            # Stage 3: Train DAD policy
+            # Train DAD policy
             if cfg.get("enable_dad", True):
                 dad_policy = train_dad_policy_mode(cfg, surrogate, args.models_dir, args.force)
-            else:
-                print("\nWARNING: DAD disabled in config")
         
         # Summary
         print("\n" + "="*80)
         print("TRAINING COMPLETE")
         print("="*80)
         print(f"\nTrained models in: {args.models_dir}/")
-        print("\nAvailable models:")
-        for filename in sorted(os.listdir(args.models_dir)):
-            filepath = os.path.join(args.models_dir, filename)
-            if os.path.isfile(filepath):
-                size_mb = os.path.getsize(filepath) / (1024 * 1024)
-                print(f"  {filename} ({size_mb:.2f} MB)")
-        
         print("\nNext steps:")
         print(f"  python test.py --config {args.config} --episodes 100")
         

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Comprehensive evaluation of all design strategies with progress bars
-Evaluates: Random, Fixed Design, Greedy MPNN, DAD Policy
+CORRECTED test.py with adaptive bounds matching paper 2023
+CRITICAL FIX: Now uses adaptive bounds based on natural frequencies
 """
 
 import yaml
@@ -29,6 +29,52 @@ except ImportError:
     TQDM_AVAILABLE = False
 
 
+def compute_adaptive_bounds(omega: np.ndarray, N: int):
+    """
+    Compute adaptive prior bounds based on frequency differences.
+    Matches AccelerateOED 2023 paper's approach.
+    
+    This is CRITICAL for paper replication:
+    - Bounds depend on |�_i - �_j| for each pair
+    - Creates heterogeneous network structure for N=5
+    """
+    aUpper = np.zeros((N, N))
+    aLower = np.zeros((N, N))
+    
+    for i in range(N):
+        for j in range(i + 1, N):
+            # Synchronization threshold based on frequency difference
+            syncThreshold = 0.5 * np.abs(omega[i] - omega[j])
+            
+            # Prior bounds: �15% around sync threshold
+            aUpper[i, j] = syncThreshold * 1.15
+            aLower[i, j] = syncThreshold * 0.85
+            
+            # Make symmetric
+            aUpper[j, i] = aUpper[i, j]
+            aLower[j, i] = aLower[i, j]
+    
+    # Paper's heterogeneous coupling structure for N=5
+    if N == 5:
+        # Weaker coupling for pairs (0,2), (0,3), (0,4)
+        for i in [0]:
+            for j in range(2, 5):
+                aUpper[i, j] *= 0.3
+                aLower[i, j] *= 0.3
+                aUpper[j, i] = aUpper[i, j]
+                aLower[j, i] = aLower[i, j]
+        
+        # Medium coupling for pairs (1,3), (1,4)
+        for i in [1]:
+            for j in range(3, 5):
+                aUpper[i, j] *= 0.45
+                aLower[i, j] *= 0.45
+                aUpper[j, i] = aUpper[i, j]
+                aLower[j, i] = aLower[i, j]
+    
+    return aLower, aUpper
+
+
 def load_config(path: str) -> Dict[str, Any]:
     """Load configuration"""
     with open(path, "r") as f:
@@ -36,19 +82,28 @@ def load_config(path: str) -> Dict[str, Any]:
 
 
 def make_env_factory(cfg: Dict, surrogate, episode_counter=[0]):
-    """Create environment factory with unique seeds per episode"""
+    """
+    Create environment factory with adaptive bounds (PAPER 2023).
+    
+    CRITICAL FIX: This now uses adaptive bounds based on omega,
+    matching the paper's approach and data generation.
+    """
     def env_factory():
         N, K = cfg["N"], cfg["K"]
         episode_seed = cfg["seed"] + episode_counter[0]
         episode_counter[0] += 1
         rng = np.random.default_rng(episode_seed)
         
+        # Generate natural frequencies
         if cfg["omega"]["kind"] == "uniform":
             omega = rng.uniform(cfg["omega"]["low"], cfg["omega"]["high"], size=N)
         else:
             omega = rng.normal(0.0, 1.0, size=N)
         
-        prior = (cfg["prior_lower"], cfg["prior_upper"])
+        #  FIXED: Use adaptive bounds based on omega (paper 2023)
+        aLower, aUpper = compute_adaptive_bounds(omega, N)
+        prior = (aLower, aUpper)  # Pass matrices, not scalars
+        
         return PairTestEnv(N=N, omega=omega, prior_bounds=prior, K=K, 
                           surrogate=surrogate, rng=rng)
     return env_factory
@@ -73,57 +128,6 @@ def fixed_design_chooser_factory(fixed_sequence):
     
     return fixed_chooser
 
-def make_env_factory(cfg: Dict, surrogate, episode_counter=[0]):
-    """Create environment factory with unique seeds per episode"""
-    def env_factory():
-        N, K = cfg["N"], cfg["K"]
-        episode_seed = cfg["seed"] + episode_counter[0]
-        episode_counter[0] += 1
-        rng = np.random.default_rng(episode_seed)
-        
-        # Match paper's omega range
-        if cfg["omega"]["kind"] == "uniform":
-            omega = rng.uniform(cfg["omega"]["low"], cfg["omega"]["high"], size=N)
-        else:
-            omega = rng.normal(0.0, 1.0, size=N)
-        
-        # CRITICAL: Use adaptive bounds
-        aLower, aUpper = compute_adaptive_bounds_for_env(omega, N)
-        prior = (aLower, aUpper)  # Now returns matrices
-        
-        return PairTestEnv(N=N, omega=omega, prior_bounds=prior, K=K, 
-                          surrogate=surrogate, rng=rng)
-    return env_factory
-
-def compute_adaptive_bounds_for_env(omega, N):
-    """Helper to compute adaptive bounds for env"""
-    aUpper = np.zeros((N, N))
-    aLower = np.zeros((N, N))
-    
-    for i in range(N):
-        for j in range(i + 1, N):
-            syncThreshold = 0.5 * np.abs(omega[i] - omega[j])
-            aUpper[i, j] = syncThreshold * 1.15
-            aLower[i, j] = syncThreshold * 0.85
-            aUpper[j, i] = aUpper[i, j]
-            aLower[j, i] = aLower[i, j]
-    
-    if N == 5:
-        for i in [0]:
-            for j in range(2, 5):
-                aUpper[i, j] *= 0.3
-                aLower[i, j] *= 0.3
-                aUpper[j, i] = aUpper[i, j]
-                aLower[j, i] = aLower[i, j]
-        
-        for i in [1]:
-            for j in range(3, 5):
-                aUpper[i, j] *= 0.45
-                aLower[i, j] *= 0.45
-                aUpper[j, i] = aUpper[i, j]
-                aLower[j, i] = aLower[i, j]
-    
-    return aLower, aUpper
 
 def greedy_chooser(env, cands):
     """Greedy MPNN chooser (2023 AccelerateOED)"""
@@ -440,7 +444,7 @@ def save_results_json(comparison_results: Dict, filepath: str):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate all design strategies"
+        description="CORRECTED evaluation with adaptive bounds (paper 2023)"
     )
     parser.add_argument("--config", default="configs/config.yaml")
     parser.add_argument("--episodes", type=int, default=50)
@@ -458,11 +462,12 @@ def main():
     cfg = load_config(args.config)
     
     print("="*80)
-    print("COMPREHENSIVE EVALUATION")
+    print("CORRECTED EVALUATION (Paper 2023)")
     print("="*80)
     print(f"Config: {args.config}")
     print(f"Episodes: {args.episodes}")
     print(f"Device: {device.upper()}")
+    print(f"CRITICAL FIX: Adaptive bounds enabled ")
     print("="*80)
     
     # Load models
